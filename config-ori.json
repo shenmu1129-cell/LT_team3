@@ -1,0 +1,136 @@
+{
+    "system": {
+      "name": "Vehicle-Cloud Security System",
+      "version": "1.0.0",
+      "description": "Federated learning based vehicle threat detection"
+    },
+    
+    "models": {
+      "cloud": {
+        "name": "meta-llama/Llama-2-7b-hf",
+        "type": "LLM",
+        "parameters": "7B",
+        "description": "Cloud-side large language model for global analysis"
+      },
+      "vehicles": [
+        {
+          "id": 0,
+          "name": "gpt2-xl",
+          "type": "SLM",
+          "parameters": "1.5B",
+          "description": "Vehicle client 0"
+        },
+        {
+          "id": 1,
+          "name": "facebook/opt-1.3b",
+          "type": "SLM",
+          "parameters": "1.3B",
+          "description": "Vehicle client 1"
+        },
+        {
+          "id": 2,
+          "name": "bigscience/bloom-1b1",
+          "type": "SLM",
+          "parameters": "1.1B",
+          "description": "Vehicle client 2"
+        },
+        {
+          "id": 3,
+          "name": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+          "type": "SLM",
+          "parameters": "1.1B",
+          "description": "Vehicle client 3"
+        }
+      ]
+    },
+    
+    "data": {
+      "public_dataset": {
+        "size": 1000,
+        "description": "Shared threat scenarios for federated learning"
+      },
+      "private_datasets": {
+        "size_per_vehicle": 500,
+        "modalities": ["image", "lidar", "can"],
+        "description": "Private vehicle sensor data"
+      }
+    },
+    
+    "training": {
+      "federated": {
+        "global_epochs": 10,
+        "aggregate_freq": 1,
+        "post_fedavg": false
+      },
+      "local": {
+        "client_priv_data_epochs": 1,
+        "client_public_data_epochs": 1,
+        "server_public_data_epochs": 1
+      },
+      "optimization": {
+        "batch_size": 4,
+        "learning_rate": 0.0003,
+        "learning_rate_cloud": 0.00003,
+        "weight_decay": 0.01,
+        "warmup_ratio": 0.008
+      },
+      "knowledge_distillation": {
+        "kd_alpha": 0.9,
+        "temperature": 1.0,
+        "distill_loss_type": "ce",
+        "distill_strategy": "greater",
+        "top_k_logits": 128
+      },
+      "token_alignment": {
+        "strategy": "dtw",
+        "skip_align": false
+      }
+    },
+    
+    "privacy": {
+      "differential_privacy": {
+        "enabled": true,
+        "epsilon": 3.0,
+        "delta": 1e-5,
+        "noise_multiplier": 1.1,
+        "max_grad_norm": 1.0
+      }
+    },
+    
+    "security": {
+      "threat_detection": {
+        "num_classes": 5,
+        "classes": ["DDoS", "Spoofing", "Replay", "Fuzzing", "Normal"],
+        "threshold": 0.8,
+        "attack_pattern_window": 100
+      },
+      "defense_actions": {
+        "0": "isolate_network",
+        "1": "rate_limit",
+        "2": "alert_driver",
+        "3": "switch_safe_mode",
+        "4": "block_malicious_can"
+      }
+    },
+    
+    "hardware": {
+      "cloud": {
+        "device": "cuda",
+        "num_gpus": 8,
+        "precision": "fp16"
+      },
+      "vehicle": {
+        "device": "cuda",
+        "num_gpus": 1,
+        "precision": "fp16",
+        "memory_limit": "8GB"
+      }
+    },
+    
+    "logging": {
+      "level": "INFO",
+      "save_logs": true,
+      "log_dir": "./outputs/logs",
+      "tensorboard": true
+    }
+  }

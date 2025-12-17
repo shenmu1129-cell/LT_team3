@@ -1,0 +1,303 @@
+"""
+联邦服务器模块
+
+实现FederatedServer类，负责收集客户端logits、计算权重、聚合并下发全局知识。
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from typing import Dict, List, Tuple, Optional, Any
+import numpy as np
+import time
+
+from .config import FederatedConfig
+from .active_inference import compute_client_weights
+from .utils import logits_statistics, align_logits
+from .comm import GlobalLogitsPackage
+
+
+class FederatedServer:
+    """联邦学习服务器"""
+    
+    def __init__(
+        self,
+        model: nn.Module,
+        device: str,
+        config: FederatedConfig,
+        server_data_loader: Optional[DataLoader] = None
+    ):
+        """
+        Args:
+            model: 服务器端Qwen3VL模型
+            device: 计算设备
+            config: 联邦学习配置
+            server_data_loader: 服务器自有数据加载器（可选）
+        """
+        self.model = model.to(device)
+        self.device = device
+        self.config = config
+        self.server_data_loader = server_data_loader
+        
+        # 如果启用服务器更新，初始化优化器
+        if config.enable_server_update:
+            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+            self.optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=config.server_lr,
+                weight_decay=config.weight_decay
+            )
+        else:
+            self.optimizer = None
+        
+        # 历史记录
+        self.aggregation_history = []
+        self.weight_history = []
+        
+        # 先验logits（用于第一轮或KL方案）
+        self.prior_logits = None
+    
+    def collect_client_logits(
+        self,
+        client_logits_dict: Dict[int, torch.Tensor]
+    ) -> Tuple[List[torch.Tensor], List[int]]:
+        """
+        收集所有客户端的logits
+        
+        Args:
+            client_logits_dict: {client_id: logits}映射
+            
+        Returns:
+            logits_list: 按客户端ID排序的logits列表
+            client_ids: 客户端ID列表
+        """
+        # 按客户端ID排序
+        sorted_items = sorted(client_logits_dict.items(), key=lambda x: x[0])
+        client_ids = [cid for cid, _ in sorted_items]
+        logits_list = [logits.to(self.device) for _, logits in sorted_items]
+        
+        # 对齐logits形状
+        logits_list = align_logits(logits_list)
+        
+        return logits_list, client_ids
+    
+    def compute_client_weights(
+        self,
+        free_energies: List[float]
+    ) -> np.ndarray:
+        """
+        基于自由能计算客户端权重
+        
+        Args:
+            free_energies: 各客户端的自由能列表
+            
+        Returns:
+            weights: 归一化的权重数组，和为1
+        """
+        weights = compute_client_weights(
+            free_energies,
+            tau=self.config.tau
+        )
+        
+        self.weight_history.append(weights.copy())
+        return weights
+    
+    def aggregate_logits(
+        self,
+        client_logits: List[torch.Tensor],
+        weights: np.ndarray
+    ) -> torch.Tensor:
+        """
+        加权聚合客户端logits
+        global_logits = Σ(w_i * logits_i)
+        
+        Args:
+            client_logits: 客户端logits列表
+            weights: 权重数组
+            
+        Returns:
+            global_logits: 聚合后的全局logits
+        """
+        if not client_logits:
+            raise ValueError("客户端logits列表为空")
+        
+        # 确保权重和为1
+        weights = weights / np.sum(weights)
+        
+        # 加权求和
+        global_logits = torch.zeros_like(client_logits[0])
+        for i, logits in enumerate(client_logits):
+            global_logits += weights[i] * logits
+        
+        # 记录聚合历史
+        stats = logits_statistics(global_logits)
+        self.aggregation_history.append(stats)
+        
+        # 更新先验logits
+        self.prior_logits = global_logits.clone().detach()
+        
+        return global_logits
+    
+    def broadcast_global_logits(
+        self,
+        global_logits: torch.Tensor,
+        weights: np.ndarray,
+        free_energies: List[float],
+        round_id: int
+    ) -> GlobalLogitsPackage:
+        """
+        广播全局logits给所有客户端
+        
+        Args:
+            global_logits: 聚合的全局logits
+            weights: 客户端权重
+            free_energies: 客户端自由能
+            round_id: 当前回合ID
+            
+        Returns:
+            GlobalLogitsPackage: 全局logits包
+        """
+        return GlobalLogitsPackage(
+            global_logits=global_logits.cpu(),  # 转到CPU以便传输
+            weights=weights,
+            free_energies=free_energies,
+            round_id=round_id,
+            timestamp=time.time()
+        )
+    
+    def server_update(
+        self,
+        global_logits: torch.Tensor,
+        num_epochs: int = 1
+    ) -> Dict[str, float]:
+        """
+        服务器端模型自我更新（可选）
+        使用聚合的全局logits作为软标签进行蒸馏训练
+        
+        Args:
+            global_logits: 聚合的全局logits
+            num_epochs: 训练轮数
+            
+        Returns:
+            dict: 包含loss的字典
+        """
+        if not self.config.enable_server_update:
+            return {'loss': 0.0}
+        
+        if self.server_data_loader is None:
+            return {'loss': 0.0}
+        
+        self.model.train()
+        
+        total_loss = 0.0
+        num_batches = 0
+        
+        for epoch in range(num_epochs):
+            for batch in self.server_data_loader:
+                images = batch['images']
+                pointclouds = batch['pointclouds'].to(self.device)
+                
+                self.optimizer.zero_grad()
+                
+                # 服务器前向传播
+                server_logits = self.model(images, pointclouds, mode='train')
+                
+                # 使用全局logits作为软标签
+                global_logits_batch = global_logits.to(self.device)
+                
+                # KL散度损失
+                T = self.config.temperature
+                server_soft = F.log_softmax(server_logits / T, dim=-1)
+                global_soft = F.softmax(global_logits_batch / T, dim=-1)
+                
+                loss = F.kl_div(
+                    server_soft,
+                    global_soft,
+                    reduction='batchmean'
+                ) * (T * T)
+                
+                # 反向传播
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+                num_batches += 1
+        
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        
+        return {'loss': avg_loss}
+    
+    def get_prior_logits(
+        self,
+        batch_size: int,
+        num_classes: int
+    ) -> torch.Tensor:
+        """
+        获取先验logits（用于自由能计算）
+        
+        Args:
+            batch_size: 批次大小
+            num_classes: 类别数
+            
+        Returns:
+            torch.Tensor: 先验logits
+        """
+        if self.prior_logits is not None:
+            # 使用上一轮的聚合logits作为先验
+            return self.prior_logits.to(self.device)
+        else:
+            # 第一轮：使用均匀先验
+            return torch.zeros(batch_size, num_classes, device=self.device)
+    
+    def get_aggregation_stats(self) -> Dict[str, Any]:
+        """获取聚合统计信息"""
+        if not self.aggregation_history:
+            return {}
+        
+        latest_stats = self.aggregation_history[-1]
+        return {
+            'latest': latest_stats,
+            'history_length': len(self.aggregation_history)
+        }
+    
+    def get_weight_stats(self) -> Dict[str, Any]:
+        """获取权重统计信息"""
+        if not self.weight_history:
+            return {}
+        
+        latest_weights = self.weight_history[-1]
+        return {
+            'latest_weights': latest_weights.tolist(),
+            'mean': float(np.mean(latest_weights)),
+            'std': float(np.std(latest_weights)),
+            'max': float(np.max(latest_weights)),
+            'min': float(np.min(latest_weights))
+        }
+    
+    def save_model(self, filepath: str) -> None:
+        """保存服务器模型"""
+        state = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer else None,
+            'prior_logits': self.prior_logits,
+            'aggregation_history': self.aggregation_history,
+            'weight_history': self.weight_history
+        }
+        torch.save(state, filepath)
+    
+    def load_model(self, filepath: str) -> None:
+        """加载服务器模型"""
+        state = torch.load(filepath)
+        self.model.load_state_dict(state['model_state_dict'])
+        
+        if self.optimizer and state['optimizer_state_dict']:
+            self.optimizer.load_state_dict(state['optimizer_state_dict'])
+        
+        self.prior_logits = state.get('prior_logits')
+        self.aggregation_history = state.get('aggregation_history', [])
+        self.weight_history = state.get('weight_history', [])
+    
+    def __repr__(self) -> str:
+        return f"FederatedServer(device={self.device}, enable_update={self.config.enable_server_update})"

@@ -1,0 +1,13 @@
+{
+    "data": {
+      "dataset_type": "nuscenes",
+      "nuscenes": {
+        "dataroot": "/data/sets/nuscenes",
+        "version": "v1.0-mini",
+        "cameras": ["CAM_FRONT"],
+        "num_lidar_points": 1024,
+        "sample_interval": 2,
+        "attack_ratio": 0.3
+      }
+    }
+  }

@@ -1,0 +1,20 @@
+# python
+__pycache__/
+*.pyc
+
+# logs & outputs
+logs_federated/
+logs_qwen3vl/
+test_outputs/
+backup/
+
+# checkpoints / weights
+checkpoints_federated/
+checkpoints_qwen3vl/
+weights/
+
+# env / local
+.conda/
+.cache/
+.vscode-server/
+.kiro/
