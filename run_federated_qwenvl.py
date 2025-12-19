@@ -21,6 +21,10 @@ import sys
 import argparse
 import json
 import time
+
+# 禁用Tokenizer并行警告
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 from typing import List, Dict, Any
 import torch
 from torch.utils.data import DataLoader, Subset

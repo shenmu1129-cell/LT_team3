@@ -122,79 +122,77 @@ class Qwen3VLDefenseSystem(nn.Module):
         return results
     
     def _training_forward(self, images, pc_features, batch_size):
-        """训练模式的前向传播 - 使用分类头"""
-        logits_list = []
-        
+        """训练模式的前向传播 - 使用分类头 (批量优化版)"""
+        # 1. 准备 PIL 图像列表
+        pil_images = []
         for i in range(batch_size):
-            # 获取单个样本
             if isinstance(images, list):
-                image = images[i]
+                pil_images.append(images[i])
             else:
-                image = transforms.ToPILImage()(images[i].cpu())
-            
-            # 提取Qwen3-VL的视觉特征（保留梯度）
-            vision_feature = self._extract_vision_features(image)  # [qwen_hidden_dim]
-            
-            # 获取点云特征
-            pc_feature = pc_features[i]  # [pointcloud_dim]
-            
-            # 调试信息（仅首次打印）
-            if i == 0 and logits_list == []:
-                print(f"\n[调试] 特征维度信息:")
-                print(f"  vision_feature: {vision_feature.shape}")
-                print(f"  pc_feature: {pc_feature.shape}")
-            
-            # 拼接特征
-            combined_feature = torch.cat([vision_feature, pc_feature], dim=0)
-            
-            # 调试信息（仅首次打印）
-            if i == 0 and len(logits_list) == 0:
-                print(f"  combined_feature: {combined_feature.shape}")
-                print(f"  分类头期望输入: {self.classifier[0].in_features}")
-            
-            # 通过分类头得到logit
-            logit = self.classifier(combined_feature)  # [1]
-            logits_list.append(logit)
+                pil_images.append(transforms.ToPILImage()(images[i].cpu()))
         
-        # 拼接成batch
-        logits = torch.stack(logits_list, dim=0)  # [B, 1]
+        # 2. 批量提取视觉特征 [B, vision_dim]
+        vision_features = self._extract_vision_features(pil_images)
+        
+        # 3. 拼接特征 [B, vision_dim] + [B, pc_dim] -> [B, combined_dim]
+        pc_features = pc_features.to(vision_features.device)
+        combined_features = torch.cat([vision_features, pc_features], dim=1)
+        
+        # 调试信息（仅在第一次运行时打印）
+        if not hasattr(self, "_batched_debug_done"):
+            print(f"\n[调试] 批量特征维度信息:")
+            print(f"  vision_features: {vision_features.shape}")
+            print(f"  pc_features: {pc_features.shape}")
+            print(f"  combined_features: {combined_features.shape}")
+            print(f"  分类头期望输入: {self.classifier[0].in_features}")
+            self._batched_debug_done = True
+            
+        # 4. 通过分类头得到 logits [B, 1]
+        classifier_device = next(self.classifier.parameters()).device
+        logits = self.classifier(combined_features.to(classifier_device))
         
         return logits
-    
-    def _extract_vision_features(self, image):
-        """提取Qwen3-VL的视觉特征（用于训练，保留梯度）"""
-        # 构建简单的消息
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": "Analyze this image."},
-            ],
-        }]
+
+    def _extract_vision_features(self, images):
+        """批量提取Qwen3-VL的视觉特征（用于训练，保留梯度）"""
+        if not isinstance(images, list):
+            images = [images]
+            
+        # 构建批量消息
+        all_messages = []
+        for img in images:
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": "Analyze this image."},
+                ],
+            }]
+            all_messages.append(messages)
         
-        # 处理输入
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
+        # 批量处理输入
+        texts = [self.processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in all_messages]
+        image_inputs, video_inputs = process_vision_info(all_messages)
+        
         inputs = self.processor(
-            text=[text],
+            text=texts,
             images=image_inputs,
             videos=video_inputs,
             padding=True,
             return_tensors="pt",
         )
+        # 移动到模型所在设备
         inputs = {k: v.to(self.qwen_vl.device) for k, v in inputs.items()}
         
         # 前向传播获取隐藏状态（保留梯度）
         with torch.set_grad_enabled(self.training):
             outputs = self.qwen_vl.model(**inputs, output_hidden_states=True)
-            # 取最后一层隐藏状态
-            hidden_states = outputs.hidden_states[-1]  # [1, seq_len, hidden_dim]
-            # 使用平均池化得到全局特征
-            vision_feature = hidden_states.mean(dim=1).squeeze(0)  # [hidden_dim]
+            # 取最后一层隐藏状态 [B, seq_len, hidden_dim]
+            hidden_states = outputs.hidden_states[-1]
+            # 使用平均池化得到全局特征 [B, hidden_dim]
+            vision_features = hidden_states.mean(dim=1)
         
-        return vision_feature
+        return vision_features
     
     def _detection_mode(self, images, pc_embeddings, batch_size):
         """攻击检测模式"""
