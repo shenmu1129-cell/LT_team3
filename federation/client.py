@@ -187,6 +187,11 @@ class FederatedClient:
         
         for epoch in range(num_epochs):
             for batch_idx, batch in enumerate(self.data_loader):
+                # 检查是否达到最大batch限制
+                if hasattr(self.config, 'max_batches') and self.config.max_batches > 0:
+                    if batch_idx >= self.config.max_batches:
+                        break
+                
                 images = batch['images']
                 pointclouds = batch['pointclouds'].to(self.device)
                 labels = batch['labels'].to(self.device)
@@ -221,6 +226,8 @@ class FederatedClient:
                     predicted_labels = (predictions > 0.5).long()
                     all_predictions.extend(predicted_labels.cpu().numpy())
                     all_labels.extend(labels.cpu().numpy())
+        
+        print(f"  [Client {self.client_id}] 本地更新完成: 运行了 {num_batches} 个 batches")
         
         # 计算平均损失
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0

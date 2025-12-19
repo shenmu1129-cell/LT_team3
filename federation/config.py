@@ -45,6 +45,7 @@ class FederatedConfig:
     dataroot: str = "/home/sutongtong/LanTu_team3/dataset/nuScenes/train"
     version: str = "v1.0-trainval"
     batch_size: int = 1
+    max_batches: int = 0  # 每轮每客户端最大训练batch数，0表示跑完整个epoch
     num_workers: int = 2
     attack_ratio: float = 0.3
     num_points: int = 2048

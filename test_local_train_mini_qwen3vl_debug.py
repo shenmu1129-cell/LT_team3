@@ -11,6 +11,7 @@ from PIL import Image
 import torchvision.transforms as T
 from nuscenes.utils.splits import create_splits_scenes
 import os
+import time
 from datetime import datetime
 from torch.utils.data import DataLoader
 import json
@@ -22,21 +23,19 @@ class Qwen3VLDefenseSystem(nn.Module):
     
     def __init__(self, 
                  pointcloud_dim=1024,
-                #  qwen_hidden_dim=1536,  # Qwen3-VL-2B的隐藏层维度
-                qwen_hidden_dim=3072,  # Qwen3-VL-2B的隐藏层维度
+                 qwen_hidden_dim=2048,  # Qwen3-VL-2B 视觉塔的真实输出维度
                  model_name=r'/home/sutongtong/wwt/model/Qwen3-VL-2B-Instruct'):
         super().__init__()
         
         # 1. 加载Qwen3-VL模型和processor
         self.processor = AutoProcessor.from_pretrained(
             model_name,
-            min_pixels=256*32*32,  # Qwen3-VL使用32的倍数
-            max_pixels=1280*32*32,
+            min_pixels=224*224,  # 降低分辨率以提升速度
+            max_pixels=448*448,
         )
         
         self.qwen_vl = AutoModelForImageTextToText.from_pretrained(
             model_name,
-            # torch_dtype=torch.bfloat16,  # Qwen3-VL推荐使用bfloat16
             dtype=torch.bfloat16,  # Qwen3-VL推荐使用bfloat16
             device_map="auto",
         )
@@ -52,8 +51,7 @@ class Qwen3VLDefenseSystem(nn.Module):
         
         # 4. 可训练的分类头（用于训练）
         self.classifier = nn.Sequential(
-            # nn.Linear(qwen_hidden_dim + pointcloud_dim, 512),
-            nn.Linear(qwen_hidden_dim, 512),
+            nn.Linear(qwen_hidden_dim + pointcloud_dim, 512),
             nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(0.3),
@@ -154,43 +152,40 @@ class Qwen3VLDefenseSystem(nn.Module):
         return logits
 
     def _extract_vision_features(self, images):
-        """批量提取Qwen3-VL的视觉特征（用于训练，保留梯度）"""
+        """批量提取视觉特征 (跳过 LLM，仅使用 Vision Tower)"""
         if not isinstance(images, list):
             images = [images]
             
-        # 构建批量消息
-        all_messages = []
-        for img in images:
-            messages = [{
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": img},
-                    {"type": "text", "text": "Analyze this image."},
-                ],
-            }]
-            all_messages.append(messages)
+        # 1. 快速处理输入 (仅使用 image_processor 提取视觉张量，绕过文本处理逻辑)
+        inputs = self.processor.image_processor(images=images, return_tensors="pt")
         
-        # 批量处理输入
-        texts = [self.processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in all_messages]
-        image_inputs, video_inputs = process_vision_info(all_messages)
+        # 移动到视觉塔所在设备
+        vision_device = next(self.qwen_vl.visual.parameters()).device
+        pixel_values = inputs["pixel_values"].to(vision_device).to(torch.bfloat16)
+        image_grid_thw = inputs["image_grid_thw"].to(vision_device)
         
-        inputs = self.processor(
-            text=texts,
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        # 移动到模型所在设备
-        inputs = {k: v.to(self.qwen_vl.device) for k, v in inputs.items()}
+        # [性能监控] 开始计时
+        start_time = time.time()
         
-        # 前向传播获取隐藏状态（保留梯度）
+        # 2. 直接调用视觉编码器 (Vision Tower)
         with torch.set_grad_enabled(self.training):
-            outputs = self.qwen_vl.model(**inputs, output_hidden_states=True)
-            # 取最后一层隐藏状态 [B, seq_len, hidden_dim]
-            hidden_states = outputs.hidden_states[-1]
-            # 使用平均池化得到全局特征 [B, hidden_dim]
-            vision_features = hidden_states.mean(dim=1)
+            # Qwen3-VL 的视觉模块是 visual
+            vision_outputs = self.qwen_vl.visual(
+                pixel_values,
+                grid_thw=image_grid_thw
+            )
+            
+            # 如果返回的是 tuple (通常包含 hidden_states 和 potential weights)，取第一个元素
+            if isinstance(vision_outputs, tuple):
+                vision_outputs = vision_outputs[0]
+            
+            # 3. 将 Tokens 还原并进行平均池化得到 [B, Hidden_Dim]
+            batch_size = len(images)
+            vision_features = vision_outputs.view(batch_size, -1, vision_outputs.shape[-1]).mean(dim=1)
+            
+        # [性能监控] 结束计时
+        duration = time.time() - start_time
+        print(f"[性能监控] 视觉塔提取耗时: {duration:.4f} 秒 (Batch Size: {batch_size})")
         
         return vision_features
     
@@ -848,8 +843,7 @@ def train_on_mini():
     
     model = Qwen3VLDefenseSystem(
         pointcloud_dim=1024,
-        # qwen_hidden_dim=1536,
-        qwen_hidden_dim=3072,
+        qwen_hidden_dim=2048,
         model_name="Qwen/Qwen3-VL-2B-Instruct"
     )
     

@@ -70,7 +70,7 @@ def parse_args():
                         help='Qwen3-VL模型路径')
     parser.add_argument('--pointcloud_dim', type=int, default=1024,
                         help='点云特征维度')
-    parser.add_argument('--qwen_hidden_dim', type=int, default=3072,
+    parser.add_argument('--qwen_hidden_dim', type=int, default=2048,
                         help='Qwen3-VL隐藏层维度')
     
     # 蒸馏损失参数
@@ -111,6 +111,8 @@ def parse_args():
                         help='nuScenes版本')
     parser.add_argument('--batch_size', type=int, default=1,
                         help='批次大小')
+    parser.add_argument('--max_batches', type=int, default=0,
+                        help='每轮每客户端最大训练batch数，0表示跑完整个epoch')
     parser.add_argument('--num_workers', type=int, default=2,
                         help='数据加载线程数')
     parser.add_argument('--attack_ratio', type=float, default=0.3,
@@ -179,6 +181,7 @@ def create_config_from_args(args) -> FederatedConfig:
             dataroot=args.dataroot,
             version=args.version,
             batch_size=args.batch_size,
+            max_batches=args.max_batches,
             num_workers=args.num_workers,
             attack_ratio=args.attack_ratio,
             num_points=args.num_points,
@@ -427,6 +430,7 @@ def run_federated_round(
         
         # 本地更新
         update_metrics = client.local_update_with_distillation(global_logits_local)
+        logger.log(f"  Client {client.client_id}: 本地更新完成 (max_batches={config.max_batches})")
         
         # 记录客户端指标
         client_metrics = ClientMetrics(
