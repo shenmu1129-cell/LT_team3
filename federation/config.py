@@ -46,6 +46,7 @@ class FederatedConfig:
     version: str = "v1.0-trainval"
     batch_size: int = 1
     max_batches: int = 0  # 每轮每客户端最大训练batch数，0表示跑完整个epoch
+    server_max_batches: int = 0  # 服务器公共数据集最大batch数，0表示跑完整个数据集
     num_workers: int = 2
     attack_ratio: float = 0.3
     num_points: int = 2048

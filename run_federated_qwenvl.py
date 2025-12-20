@@ -113,6 +113,8 @@ def parse_args():
                         help='批次大小')
     parser.add_argument('--max_batches', type=int, default=0,
                         help='每轮每客户端最大训练batch数，0表示跑完整个epoch')
+    parser.add_argument('--server_max_batches', type=int, default=0,
+                        help='服务器公共数据集最大batch数，0表示跑完整个数据集')
     parser.add_argument('--num_workers', type=int, default=2,
                         help='数据加载线程数')
     parser.add_argument('--attack_ratio', type=float, default=0.3,
@@ -182,6 +184,7 @@ def create_config_from_args(args) -> FederatedConfig:
             version=args.version,
             batch_size=args.batch_size,
             max_batches=args.max_batches,
+            server_max_batches=args.server_max_batches,
             num_workers=args.num_workers,
             attack_ratio=args.attack_ratio,
             num_points=args.num_points,
@@ -211,12 +214,37 @@ def init_server(config: FederatedConfig) -> FederatedServer:
         model_name=config.model_path
     )
     
-    # 创建服务器（暂不提供服务器数据）
+    # 加载公共数据集（用于评估和服务器更新）
+    print("加载服务器公共数据集 (val split)...")
+    try:
+        common_dataset = NuScenesMiniDataset(
+            dataroot=config.dataroot,
+            version=config.version,
+            split='val',
+            attack_ratio=config.attack_ratio,
+            num_points=config.num_points,
+            use_cache=True
+        )
+        
+        common_loader = DataLoader(
+            common_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            collate_fn=custom_collate_fn,
+            pin_memory=True
+        )
+        print(f"✓ 公共数据集加载成功: {len(common_dataset)} 样本")
+    except Exception as e:
+        print(f"⚠️ 公共数据集加载失败: {e}，将不使用服务器数据")
+        common_loader = None
+    
+    # 创建服务器
     server = FederatedServer(
         model=server_model,
         device=config.device,
         config=config,
-        server_data_loader=None
+        server_data_loader=common_loader
     )
     
     print(f"✓ 服务器初始化完成: {server}")
@@ -454,6 +482,19 @@ def run_federated_round(
     
     logger.log_communication_stats(comm_stats)
     
+    # ========== 阶段9: 全局评估 (使用公共数据集) ==========
+    if server.server_data_loader is not None:
+        logger.log("阶段9: 全局评估 (使用公共数据集)")
+        # 使用服务器模型在公共数据集上评估
+        global_metrics = server.evaluate()
+        logger.log(f"  Global Metrics: Acc={global_metrics['accuracy']:.4f}, F1={global_metrics['f1_score']:.4f}")
+        
+        # 将全局指标存入 round_metrics 以便记录
+        round_metrics.server_metrics.update({
+            'global_accuracy': global_metrics['accuracy'],
+            'global_f1': global_metrics['f1_score']
+        })
+    
     # 计算平均指标
     avg_metrics = {
         'avg_accuracy': np.mean([cm.accuracy for cm in round_metrics.client_metrics.values()]),
@@ -461,6 +502,9 @@ def run_federated_round(
         'avg_free_energy': np.mean(free_energies),
         'avg_weight': np.mean(weights)
     }
+    
+    if 'global_f1' in round_metrics.server_metrics:
+        avg_metrics['global_f1'] = round_metrics.server_metrics['global_f1']
     
     logger.log_round_end(round_id, avg_metrics)
     

@@ -194,7 +194,12 @@ class FederatedServer:
         num_batches = 0
         
         for epoch in range(num_epochs):
-            for batch in self.server_data_loader:
+            for batch_idx, batch in enumerate(self.server_data_loader):
+                # 检查是否达到最大batch限制
+                if hasattr(self.config, 'server_max_batches') and self.config.server_max_batches > 0:
+                    if batch_idx >= self.config.server_max_batches:
+                        break
+                
                 images = batch['images']
                 pointclouds = batch['pointclouds'].to(self.device)
                 
@@ -276,6 +281,51 @@ class FederatedServer:
             'min': float(np.min(latest_weights))
         }
     
+    def evaluate(self) -> Dict[str, float]:
+        """
+        在服务器公共数据上评估模型
+        
+        Returns:
+            dict: 评估指标
+        """
+        if self.server_data_loader is None:
+            return {'accuracy': 0.0, 'f1_score': 0.0}
+            
+        self.model.eval()
+        
+        all_predictions = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(self.server_data_loader):
+                # 检查是否达到最大batch限制
+                if hasattr(self.config, 'server_max_batches') and self.config.server_max_batches > 0:
+                    if batch_idx >= self.config.server_max_batches:
+                        break
+                
+                images = batch['images']
+                pointclouds = batch['pointclouds'].to(self.device)
+                labels = batch['labels']
+                
+                # 前向传播
+                logits = self.model(images, pointclouds, mode='train')
+                
+                # 预测
+                predictions = torch.sigmoid(logits.squeeze(-1))
+                predicted_labels = (predictions > 0.5).long()
+                
+                all_predictions.extend(predicted_labels.cpu().numpy())
+                all_labels.extend(labels.numpy())
+        
+        # 计算指标
+        from .utils import compute_metrics
+        metrics = compute_metrics(
+            np.array(all_predictions),
+            np.array(all_labels)
+        )
+        
+        return metrics
+
     def save_model(self, filepath: str) -> None:
         """保存服务器模型"""
         state = {
