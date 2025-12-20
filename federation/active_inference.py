@@ -27,6 +27,13 @@ def safe_softmax(logits: torch.Tensor, temperature: float = 1.0, epsilon: float 
         torch.Tensor: softmax概率分布 [B, C]
     """
     logits = logits / temperature
+    
+    # 处理二分类单输出情况 [B, 1] -> [B, 2]
+    if logits.shape[-1] == 1:
+        prob1 = torch.sigmoid(logits)
+        prob0 = 1.0 - prob1
+        return torch.cat([prob0, prob1], dim=-1)
+        
     # 减去最大值防止溢出
     logits = logits - torch.max(logits, dim=-1, keepdim=True)[0]
     exp_logits = torch.exp(logits)
@@ -136,12 +143,20 @@ def free_energy_ce_entropy(
     q_i = safe_softmax(client_logits, temperature, epsilon)  # [B, C]
     
     # 计算交叉熵损失
-    # 注意：这里使用原始logits计算CE，因为F.cross_entropy内部会做softmax
-    ce_loss = F.cross_entropy(
-        client_logits / temperature,
-        labels,
-        reduction='none'
-    )  # [B]
+    if client_logits.shape[-1] == 1:
+        # 二分类单输出情况
+        ce_loss = F.binary_cross_entropy_with_logits(
+            client_logits / temperature,
+            labels.float().view(-1, 1),
+            reduction='none'
+        ).squeeze(-1)
+    else:
+        # 多分类情况
+        ce_loss = F.cross_entropy(
+            client_logits / temperature,
+            labels,
+            reduction='none'
+        )  # [B]
     
     # 计算熵
     entropy = safe_entropy(q_i, epsilon)  # [B]

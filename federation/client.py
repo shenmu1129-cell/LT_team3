@@ -146,8 +146,19 @@ class FederatedClient:
         
         # KL散度损失（软标签）
         # 使用温度T软化分布
-        local_soft = F.log_softmax(local_logits / T, dim=-1)
-        global_soft = F.softmax(global_logits / T, dim=-1)
+        if local_logits.shape[-1] == 1:
+            # 二分类单输出情况：转换为 [B, 2] 概率分布
+            local_prob1 = torch.sigmoid(local_logits / T)
+            local_prob0 = 1.0 - local_prob1
+            local_soft = torch.log(torch.cat([local_prob0, local_prob1], dim=-1) + 1e-8)
+            
+            global_prob1 = torch.sigmoid(global_logits / T)
+            global_prob0 = 1.0 - global_prob1
+            global_soft = torch.cat([global_prob0, global_prob1], dim=-1)
+        else:
+            # 多分类情况
+            local_soft = F.log_softmax(local_logits / T, dim=-1)
+            global_soft = F.softmax(global_logits / T, dim=-1)
         
         kl_loss = F.kl_div(
             local_soft,
