@@ -174,6 +174,7 @@ class FederatedClient:
     def local_update_with_distillation(
         self,
         global_logits: torch.Tensor,
+        target_batch: Optional[Dict[str, Any]] = None,
         num_epochs: Optional[int] = None
     ) -> Dict[str, float]:
         """
@@ -181,6 +182,7 @@ class FederatedClient:
         
         Args:
             global_logits: 服务器聚合的全局logits
+            target_batch: 指定的训练批次。如果为None，则使用本地数据加载器。
             num_epochs: 本地训练轮数，如果为None则使用config中的值
             
         Returns:
@@ -196,10 +198,16 @@ class FederatedClient:
         all_labels = []
         num_batches = 0
         
+        # 决定训练批次
+        if target_batch is not None:
+            batches = [target_batch]
+        else:
+            batches = self.data_loader
+        
         for epoch in range(num_epochs):
-            for batch_idx, batch in enumerate(self.data_loader):
+            for batch_idx, batch in enumerate(batches):
                 # 检查是否达到最大batch限制
-                if hasattr(self.config, 'max_batches') and self.config.max_batches > 0:
+                if target_batch is None and hasattr(self.config, 'max_batches') and self.config.max_batches > 0:
                     if batch_idx >= self.config.max_batches:
                         break
                 
@@ -214,6 +222,13 @@ class FederatedClient:
                 
                 # 确保global_logits在正确的设备上
                 global_logits_batch = global_logits.to(self.device)
+                
+                # 检查 batch size 是否匹配
+                if local_logits.size(0) != global_logits_batch.size(0):
+                    min_size = min(local_logits.size(0), global_logits_batch.size(0))
+                    local_logits = local_logits[:min_size]
+                    global_logits_batch = global_logits_batch[:min_size]
+                    labels = labels[:min_size]
                 
                 # 计算蒸馏损失
                 loss = self.compute_distillation_loss(
@@ -238,7 +253,8 @@ class FederatedClient:
                     all_predictions.extend(predicted_labels.cpu().numpy())
                     all_labels.extend(labels.cpu().numpy())
         
-        print(f"  [Client {self.client_id}] 本地更新完成: 运行了 {num_batches} 个 batches")
+        if self.config.verbose:
+            print(f"  [Client {self.client_id}] 本地更新完成: 运行了 {num_batches} 个 batches")
         
         # 计算平均损失
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
@@ -249,9 +265,14 @@ class FederatedClient:
             np.array(all_predictions),
             np.array(all_labels)
         )
-        metrics['loss'] = avg_loss
         
-        return metrics
+        return {
+            'loss': avg_loss,
+            'accuracy': metrics['accuracy'],
+            'precision': metrics['precision'],
+            'recall': metrics['recall'],
+            'f1_score': metrics['f1_score']
+        }
     
     def upload_logits(
         self,

@@ -362,12 +362,23 @@ def run_federated_round(
     # ========== 阶段1: 客户端本地推理 ==========
     logger.log("阶段1: 客户端本地推理")
     
+    # 如果启用了服务器更新，使用服务器公共数据的一个 batch 进行对齐推理
+    inference_batch = None
+    if config.enable_server_update and server.server_data_loader is not None:
+        if not hasattr(server, '_data_iter') or server._data_iter is None:
+            server._data_iter = iter(server.server_data_loader)
+        try:
+            inference_batch = next(server._data_iter)
+        except StopIteration:
+            server._data_iter = iter(server.server_data_loader)
+            inference_batch = next(server._data_iter)
+    
     client_logits_dict = {}
     client_labels_dict = {}
     
     for client in clients:
-        # 获取一个batch的数据进行推理
-        batch = next(iter(client.data_loader))
+        # 如果有统一的 inference_batch，则使用它；否则使用客户端自己的数据
+        batch = inference_batch if inference_batch is not None else next(iter(client.data_loader))
         
         # 本地前向推理
         logits, labels, sample_ids = client.local_forward(batch)
@@ -438,7 +449,7 @@ def run_federated_round(
     # ========== 阶段5: 服务器自我更新（可选） ==========
     if config.enable_server_update:
         logger.log("阶段5: 服务器自我更新")
-        server_metrics = server.server_update(global_logits)
+        server_metrics = server.server_update(global_logits, batch=inference_batch)
         logger.log(f"  Server loss: {server_metrics['loss']:.4f}")
     
     # ========== 阶段6: 下发global_logits ==========
@@ -456,8 +467,11 @@ def run_federated_round(
         # 接收全局logits
         global_logits_local = client.receive_global_logits(global_logits)
         
-        # 本地更新
-        update_metrics = client.local_update_with_distillation(global_logits_local)
+        # 本地更新 (如果使用了统一的 inference_batch，则在该 batch 上蒸馏)
+        update_metrics = client.local_update_with_distillation(
+            global_logits_local, 
+            target_batch=inference_batch
+        )
         logger.log(f"  Client {client.client_id}: 本地更新完成 (max_batches={config.max_batches})")
         
         # 记录客户端指标
