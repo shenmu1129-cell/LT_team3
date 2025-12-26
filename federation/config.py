@@ -49,6 +49,7 @@ class FederatedConfig:
     server_max_batches: int = 0  # 服务器公共数据集最大batch数，0表示跑完整个数据集
     num_workers: int = 2
     attack_ratio: float = 0.3
+    malicious_client_ratio: float = 0.0  # 恶意客户端比例 (0.0-1.0)
     num_points: int = 2048
     
     # ========== 训练参数 ==========
@@ -69,6 +70,7 @@ class FederatedConfig:
     def validate(self) -> None:
         """验证配置参数的合法性"""
         assert self.num_clients > 0, "num_clients必须大于0"
+        assert 0 <= self.malicious_client_ratio <= 1.0, "malicious_client_ratio必须在[0, 1]范围内"
         assert self.num_rounds > 0, "num_rounds必须大于0"
         assert self.local_epochs > 0, "local_epochs必须大于0"
         

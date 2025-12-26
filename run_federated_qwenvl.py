@@ -119,6 +119,8 @@ def parse_args():
                         help='数据加载线程数')
     parser.add_argument('--attack_ratio', type=float, default=0.3,
                         help='攻击样本比例')
+    parser.add_argument('--malicious_client_ratio', type=float, default=0.0,
+                        help='恶意客户端比例 (0.0-1.0)')
     parser.add_argument('--num_points', type=int, default=2048,
                         help='点云采样点数')
     parser.add_argument('--data_partition', type=str, default='iid',
@@ -187,6 +189,7 @@ def create_config_from_args(args) -> FederatedConfig:
             server_max_batches=args.server_max_batches,
             num_workers=args.num_workers,
             attack_ratio=args.attack_ratio,
+            malicious_client_ratio=args.malicious_client_ratio,
             num_points=args.num_points,
             lr=args.lr,
             weight_decay=args.weight_decay,
@@ -293,9 +296,23 @@ def init_clients(config: FederatedConfig) -> List[FederatedClient]:
     
     # 创建客户端
     clients = []
+    num_malicious = int(config.num_clients * config.malicious_client_ratio)
+    print(f"配置恶意客户端数量: {num_malicious} / {config.num_clients} (比例: {config.malicious_client_ratio})")
+    
     for client_id in range(config.num_clients):
         # 创建客户端数据子集
         client_indices = client_indices_list[client_id]
+        
+        # 如果是良性客户端 (client_id >= num_malicious)，强制将其数据标签设为0（无攻击）
+        if client_id >= num_malicious:
+            # 注意：这里直接修改 full_dataset.attack_labels 会影响所有使用该索引的客户端
+            # 但因为 indices 是不重叠的，所以没问题。
+            # 为了更安全，我们可以在创建 Subset 后，在客户端内部处理，或者在这里修改。
+            # 既然用户要求“简单改”，我们直接在分配时处理。
+            for idx in client_indices:
+                full_dataset.attack_labels[idx] = 0
+                full_dataset.attack_types[idx] = None
+        
         client_dataset = Subset(full_dataset, client_indices)
         
         # 创建数据加载器
