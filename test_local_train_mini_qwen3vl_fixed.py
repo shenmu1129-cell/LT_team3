@@ -22,10 +22,11 @@ class Qwen3VLDefenseSystem(nn.Module):
     
     def __init__(self, 
                  pointcloud_dim=1024,
-                #  qwen_hidden_dim=1536,  # Qwen3-VL-2B的隐藏层维度
-                qwen_hidden_dim=3072,  # Qwen3-VL-2B的隐藏层维度
+                 qwen_hidden_dim=None,  # 自动检测，或手动指定
                  model_name=r'/home/sutongtong/wwt/model/Qwen3-VL-2B-Instruct'):
         super().__init__()
+        
+        self.pointcloud_dim = pointcloud_dim
         
         # 1. 加载Qwen3-VL模型和processor
         self.processor = AutoProcessor.from_pretrained(
@@ -36,23 +37,31 @@ class Qwen3VLDefenseSystem(nn.Module):
         
         self.qwen_vl = AutoModelForImageTextToText.from_pretrained(
             model_name,
-            # torch_dtype=torch.bfloat16,  # Qwen3-VL推荐使用bfloat16
-            dtype=torch.bfloat16,  # Qwen3-VL推荐使用bfloat16
+            torch_dtype=torch.bfloat16,  # Qwen3-VL推荐使用bfloat16
             device_map="auto",
         )
         
-        # 2. 点云编码器
+        # 2. 自动检测Qwen模型的隐藏层维度
+        if qwen_hidden_dim is None:
+            qwen_hidden_dim = self._get_hidden_dim()
+        self.qwen_hidden_dim = qwen_hidden_dim
+        print(f"[模型信息] Qwen隐藏层维度: {qwen_hidden_dim}, 点云特征维度: {pointcloud_dim}")
+        print(f"[模型信息] 分类器输入维度: {qwen_hidden_dim + pointcloud_dim}")
+        
+        # 3. 点云编码器
         self.pointcloud_encoder = PointCloudEncoder(output_dim=pointcloud_dim)
         
-        # 3. 点云特征适配器 - 将点云特征映射到Qwen3-VL的视觉特征空间
+        # 4. 点云特征适配器 - 将点云特征映射到Qwen3-VL的视觉特征空间
         self.pointcloud_adapter = PointCloudAdapter(
             pointcloud_dim=pointcloud_dim,
             qwen_hidden_dim=qwen_hidden_dim
         )
         
-        # 4. 可训练的分类头（用于训练）
+        # 5. 可训练的分类头（用于训练）- 5分类输出
+        self.num_classes = 5  # 0=normal, 1-4=各种攻击
+        classifier_input_dim = qwen_hidden_dim + pointcloud_dim
         self.classifier = nn.Sequential(
-            nn.Linear(qwen_hidden_dim + pointcloud_dim, 512),
+            nn.Linear(classifier_input_dim, 512),
             nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(0.3),
@@ -60,7 +69,7 @@ class Qwen3VLDefenseSystem(nn.Module):
             nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(256, 1)  # 二分类输出logit
+            nn.Linear(256, self.num_classes)  # 5分类输出logits
         )
         
         # 冻结Qwen3-VL的大部分参数
@@ -69,6 +78,25 @@ class Qwen3VLDefenseSystem(nn.Module):
         
         # 可选: 使用LoRA微调
         self._setup_lora()
+    
+    def _get_hidden_dim(self):
+        """自动获取Qwen模型的隐藏层维度"""
+        # 尝试从模型配置中获取
+        try:
+            config = self.qwen_vl.config
+            # 不同版本的Qwen可能使用不同的属性名
+            if hasattr(config, 'hidden_size'):
+                return config.hidden_size
+            elif hasattr(config, 'text_config') and hasattr(config.text_config, 'hidden_size'):
+                return config.text_config.hidden_size
+            elif hasattr(config, 'd_model'):
+                return config.d_model
+        except Exception as e:
+            print(f"[警告] 无法自动获取隐藏层维度: {e}")
+        
+        # 默认值（Qwen2-VL-2B 通常是 1536）
+        print("[警告] 使用默认隐藏层维度: 1536")
+        return 1536
         
     def _setup_lora(self):
         """设置LoRA微调 (可选)"""
@@ -137,15 +165,49 @@ class Qwen3VLDefenseSystem(nn.Module):
             # 获取点云特征
             pc_feature = pc_features[i]  # [pointcloud_dim]
             
+            # 确保点云特征在正确的设备上
+            if pc_feature.device != vision_feature.device:
+                pc_feature = pc_feature.to(vision_feature.device)
+            
+            # 确保数据类型一致（转为float32用于分类器）
+            vision_feature = vision_feature.float()
+            pc_feature = pc_feature.float()
+            
             # 拼接特征
             combined_feature = torch.cat([vision_feature, pc_feature], dim=0)
             
-            # 通过分类头得到logit
-            logit = self.classifier(combined_feature)  # [1]
+            # 首次运行时检查维度
+            if i == 0 and not hasattr(self, '_dim_checked'):
+                expected_dim = self.qwen_hidden_dim + self.pointcloud_dim
+                actual_dim = combined_feature.shape[0]
+                print(f"[维度检查] vision_feature: {vision_feature.shape}, pc_feature: {pc_feature.shape}")
+                print(f"[维度检查] combined_feature: {combined_feature.shape}, 期望: {expected_dim}")
+                
+                if actual_dim != expected_dim:
+                    print(f"[警告] 维度不匹配! 实际={actual_dim}, 期望={expected_dim}")
+                    print(f"[信息] 正在动态调整分类器输入维度...")
+                    # 动态重建分类器 - 5分类
+                    self.classifier = nn.Sequential(
+                        nn.Linear(actual_dim, 512),
+                        nn.LayerNorm(512),
+                        nn.ReLU(),
+                        nn.Dropout(0.3),
+                        nn.Linear(512, 256),
+                        nn.LayerNorm(256),
+                        nn.ReLU(),
+                        nn.Dropout(0.2),
+                        nn.Linear(256, self.num_classes)  # 5分类输出
+                    ).to(combined_feature.device)
+                    print(f"[信息] 分类器已调整为输入维度: {actual_dim}, 输出类别数: {self.num_classes}")
+                
+                self._dim_checked = True
+            
+            # 通过分类头得到logits
+            logit = self.classifier(combined_feature)  # [5]
             logits_list.append(logit)
         
         # 拼接成batch
-        logits = torch.stack(logits_list, dim=0)  # [B, 1]
+        logits = torch.stack(logits_list, dim=0)  # [B, 5]
         
         return logits
     
@@ -683,20 +745,32 @@ class NuScenesMiniDataset(Dataset):
         ])
     
     def _generate_attack_labels(self):
-        """生成模拟攻击标签"""
+        """生成模拟攻击标签（5分类：0=normal, 1-4=各种攻击）"""
         num_attacks = int(len(self.samples) * self.attack_ratio)
         attack_indices = np.random.choice(len(self.samples), num_attacks, replace=False)
         
-        self.attack_labels = np.zeros(len(self.samples), dtype=np.int64)
-        self.attack_labels[attack_indices] = 1
+        # 攻击类型映射
+        attack_types_list = ['adversarial_patch', 'sensor_spoofing', 'physical_attack', 'data_poisoning']
+        attack_type_to_label = {
+            'normal': 0,
+            'adversarial_patch': 1,
+            'sensor_spoofing': 2,
+            'physical_attack': 3,
+            'data_poisoning': 4
+        }
         
-        attack_types = ['adversarial_patch', 'sensor_spoofing', 'physical_attack', 'data_poisoning']
+        # 初始化为0（normal）
+        self.attack_labels = np.zeros(len(self.samples), dtype=np.int64)
         self.attack_types = []
+        
         for i in range(len(self.samples)):
-            if self.attack_labels[i] == 1:
-                self.attack_types.append(np.random.choice(attack_types))
+            if i in attack_indices:
+                # 随机选择一种攻击类型
+                attack_type = np.random.choice(attack_types_list)
+                self.attack_labels[i] = attack_type_to_label[attack_type]
+                self.attack_types.append(attack_type)
             else:
-                self.attack_types.append(None)
+                self.attack_types.append('normal')
     
     def __len__(self):
         return len(self.samples)

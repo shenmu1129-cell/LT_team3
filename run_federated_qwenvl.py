@@ -1,321 +1,120 @@
+#!/usr/bin/env python3
 """
-联邦学习训练入口脚本
+联邦学习入口脚本
 
-基于主动推理的端云协同联邦学习框架
-
-使用示例:
-    # 基础运行（3客户端，10回合）
-    python run_federated_qwenvl.py --num_clients 3 --num_rounds 10
-    
-    # 自定义配置
-    python run_federated_qwenvl.py --num_clients 5 --num_rounds 20 \\
-        --free_energy_mode ce_entropy --tau 0.5 --alpha 0.6 --beta 0.4
-    
-    # 启用服务器更新
-    python run_federated_qwenvl.py --num_clients 3 --num_rounds 10 \\
-        --enable_server_update
+实现完整的联邦训练闭环：
+1. 客户端本地推理 → 提取logits
+2. 上传logits到服务器
+3. 服务器计算自由能和权重
+4. 服务器聚合logits
+5. 下发全局logits给客户端
+6. 客户端使用蒸馏损失更新本地模型
+7. 循环进行多轮训练
 """
 
 import os
 import sys
 import argparse
-import json
 import time
-
-# 禁用Tokenizer并行警告
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-from typing import List, Dict, Any
+import json
 import torch
-from torch.utils.data import DataLoader, Subset
 import numpy as np
+from datetime import datetime
+from torch.utils.data import DataLoader, Subset
 
-# 导入原有模块
-from test_local_train_mini_qwen3vl_debug import (
+# 导入联邦学习模块
+from federation.client import FederatedClient
+from federation.server import FederatedServer
+from federation.config import FederatedConfig
+from federation.comm import CommunicationManager
+from federation.logger import FederatedLogger
+from federation.utils import partition_data_iid, partition_data_non_iid, aggregate_metrics
+
+# 导入模型和数据集
+from test_local_train_mini_qwen3vl_fixed import (
     Qwen3VLDefenseSystem,
     NuScenesMiniDataset,
     custom_collate_fn
 )
 
-# 导入联邦学习模块
-from federation import (
-    FederatedClient,
-    FederatedServer,
-    FederatedConfig,
-    FederatedLogger,
-    RoundMetrics,
-    ClientMetrics,
-    CommunicationManager
-)
-from federation.utils import partition_data_iid, partition_data_non_iid
-
-
-def parse_args():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(
-        description='联邦学习训练 - 基于主动推理的Qwen3-VL攻击检测'
+# 导入攻击数据集
+try:
+    from attacks import (
+        NuScenesAttackDataset,
+        SyntheticAttackDataset,
+        attack_collate_fn,
+        create_attack_dataset
     )
-    
-    # 联邦学习基础参数
-    parser.add_argument('--num_clients', type=int, default=3,
-                        help='客户端数量')
-    parser.add_argument('--num_rounds', type=int, default=10,
-                        help='联邦训练回合数')
-    parser.add_argument('--local_epochs', type=int, default=1,
-                        help='每轮本地训练epoch数')
-    
-    # 模型参数
-    parser.add_argument('--model_path', type=str,
-                        default='/home/sutongtong/wwt/model/Qwen3-VL-2B-Instruct',
-                        help='Qwen3-VL模型路径')
-    parser.add_argument('--pointcloud_dim', type=int, default=1024,
-                        help='点云特征维度')
-    parser.add_argument('--qwen_hidden_dim', type=int, default=2048,
-                        help='Qwen3-VL隐藏层维度')
-    
-    # 蒸馏损失参数
-    parser.add_argument('--alpha', type=float, default=0.5,
-                        help='交叉熵权重')
-    parser.add_argument('--beta', type=float, default=0.5,
-                        help='KL散度权重')
-    parser.add_argument('--temperature', type=float, default=3.0,
-                        help='蒸馏温度T')
-    
-    # 主动推理参数
-    parser.add_argument('--free_energy_mode', type=str, default='kl_entropy',
-                        choices=['kl_entropy', 'ce_entropy'],
-                        help='自由能计算模式')
-    parser.add_argument('--lambda_entropy', type=float, default=0.1,
-                        help='KL方案的熵权重λ')
-    parser.add_argument('--gamma_entropy', type=float, default=0.1,
-                        help='CE方案的熵权重γ')
-    parser.add_argument('--tau', type=float, default=1.0,
-                        help='权重计算温度τ')
-    
-    # Logits提取参数
-    parser.add_argument('--logits_mode', type=str, default='cls',
-                        choices=['cls', 'last_token', 'mean_pool'],
-                        help='Logits提取模式')
-    
-    # 服务器更新参数
-    parser.add_argument('--enable_server_update', action='store_true',
-                        help='启用服务器端模型更新')
-    parser.add_argument('--server_lr', type=float, default=1e-5,
-                        help='服务器学习率')
-    
-    # 数据参数
-    parser.add_argument('--dataroot', type=str,
-                        default='/home/sutongtong/LanTu_team3/dataset/nuScenes/train',
-                        help='nuScenes数据集路径')
-    parser.add_argument('--version', type=str, default='v1.0-trainval',
-                        help='nuScenes版本')
-    parser.add_argument('--batch_size', type=int, default=1,
-                        help='批次大小')
-    parser.add_argument('--max_batches', type=int, default=0,
-                        help='每轮每客户端最大训练batch数，0表示跑完整个epoch')
-    parser.add_argument('--server_max_batches', type=int, default=0,
-                        help='服务器公共数据集最大batch数，0表示跑完整个数据集')
-    parser.add_argument('--num_workers', type=int, default=2,
-                        help='数据加载线程数')
-    parser.add_argument('--attack_ratio', type=float, default=0.3,
-                        help='攻击样本比例')
-    parser.add_argument('--malicious_client_ratio', type=float, default=0.0,
-                        help='恶意客户端比例 (0.0-1.0)')
-    parser.add_argument('--num_points', type=int, default=2048,
-                        help='点云采样点数')
-    parser.add_argument('--data_partition', type=str, default='iid',
-                        choices=['iid', 'non_iid'],
-                        help='数据分区策略')
-    
-    # 训练参数
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='学习率')
-    parser.add_argument('--weight_decay', type=float, default=0.01,
-                        help='权重衰减')
-    
-    # 设备参数
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='计算设备')
-    
-    # 日志参数
-    parser.add_argument('--log_dir', type=str, default='./logs_federated',
-                        help='日志保存目录')
-    parser.add_argument('--save_dir', type=str, default='./checkpoints_federated',
-                        help='模型保存目录')
-    parser.add_argument('--verbose', action='store_true', default=True,
-                        help='打印详细日志')
-    
-    # 部署模式
-    parser.add_argument('--mode', type=str, default='single_process',
-                        choices=['single_process', 'multi_process'],
-                        help='部署模式')
-    
-    # 配置文件
-    parser.add_argument('--config', type=str, default=None,
-                        help='从JSON文件加载配置')
-    
-    args = parser.parse_args()
-    return args
+    ATTACK_DATASET_AVAILABLE = True
+except ImportError:
+    print("警告: 攻击数据集模块未找到，将使用原始数据集")
+    ATTACK_DATASET_AVAILABLE = False
 
 
-def create_config_from_args(args) -> FederatedConfig:
-    """从命令行参数创建配置"""
-    if args.config:
-        # 从文件加载配置
-        config = FederatedConfig.load(args.config)
+def create_model(config: FederatedConfig):
+    """创建Qwen3VL防御系统模型"""
+    
+    if config.train_generation:
+        # 使用增强模型（支持训练LLM生成任务）
+        try:
+            from models.enhanced_model import Qwen3VLDefenseSystemEnhanced
+            model = Qwen3VLDefenseSystemEnhanced(
+                pointcloud_dim=config.pointcloud_dim,
+                qwen_hidden_dim=None,  # 自动检测
+                model_name=config.model_path,
+                train_generation=True
+            )
+            print("使用增强模型（支持LLM生成训练）")
+        except ImportError:
+            print("警告：无法导入增强模型，使用标准模型")
+            model = Qwen3VLDefenseSystem(
+                pointcloud_dim=config.pointcloud_dim,
+                qwen_hidden_dim=None,  # 自动检测
+                model_name=config.model_path
+            )
     else:
-        # 从命令行参数创建配置
-        config = FederatedConfig(
-            num_clients=args.num_clients,
-            num_rounds=args.num_rounds,
-            local_epochs=args.local_epochs,
-            model_path=args.model_path,
-            pointcloud_dim=args.pointcloud_dim,
-            qwen_hidden_dim=args.qwen_hidden_dim,
-            alpha=args.alpha,
-            beta=args.beta,
-            temperature=args.temperature,
-            free_energy_mode=args.free_energy_mode,
-            lambda_entropy=args.lambda_entropy,
-            gamma_entropy=args.gamma_entropy,
-            tau=args.tau,
-            logits_mode=args.logits_mode,
-            enable_server_update=args.enable_server_update,
-            server_lr=args.server_lr,
-            dataroot=args.dataroot,
-            version=args.version,
-            batch_size=args.batch_size,
-            max_batches=args.max_batches,
-            server_max_batches=args.server_max_batches,
-            num_workers=args.num_workers,
-            attack_ratio=args.attack_ratio,
-            malicious_client_ratio=args.malicious_client_ratio,
-            num_points=args.num_points,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            device=args.device,
-            log_dir=args.log_dir,
-            save_dir=args.save_dir,
-            verbose=args.verbose,
-            mode=args.mode
+        # 使用标准模型（只训练分类）
+        model = Qwen3VLDefenseSystem(
+            pointcloud_dim=config.pointcloud_dim,
+            qwen_hidden_dim=None,  # 自动检测
+            model_name=config.model_path
         )
     
-    # 验证配置
-    config.validate()
-    
-    return config
+    return model
 
 
-def init_server(config: FederatedConfig) -> FederatedServer:
-    """初始化联邦服务器"""
-    print("\n初始化联邦服务器...")
+def setup_clients(
+    config: FederatedConfig,
+    train_dataset,
+    device: str,
+    logger: FederatedLogger
+) -> list:
+    """
+    初始化联邦客户端
     
-    # 创建服务器模型
-    server_model = Qwen3VLDefenseSystem(
-        pointcloud_dim=config.pointcloud_dim,
-        qwen_hidden_dim=config.qwen_hidden_dim,
-        model_name=config.model_path
-    )
-    
-    # 加载公共数据集（用于评估和服务器更新）
-    print("加载服务器公共数据集 (val split)...")
-    try:
-        common_dataset = NuScenesMiniDataset(
-            dataroot=config.dataroot,
-            version=config.version,
-            split='val',
-            attack_ratio=config.attack_ratio,
-            num_points=config.num_points,
-            use_cache=True
-        )
+    Args:
+        config: 联邦配置
+        train_dataset: 训练数据集
+        device: 计算设备
+        logger: 日志记录器
         
-        common_loader = DataLoader(
-            common_dataset,
-            batch_size=config.batch_size,
-            shuffle=False,
-            num_workers=config.num_workers,
-            collate_fn=custom_collate_fn,
-            pin_memory=True
-        )
-        print(f"✓ 公共数据集加载成功: {len(common_dataset)} 样本")
-    except Exception as e:
-        print(f"⚠️ 公共数据集加载失败: {e}，将不使用服务器数据")
-        common_loader = None
-    
-    # 创建服务器
-    server = FederatedServer(
-        model=server_model,
-        device=config.device,
-        config=config,
-        server_data_loader=common_loader
-    )
-    
-    print(f"✓ 服务器初始化完成: {server}")
-    
-    return server
-
-
-def init_clients(config: FederatedConfig) -> List[FederatedClient]:
-    """初始化联邦客户端"""
-    print(f"\n初始化 {config.num_clients} 个联邦客户端...")
-    
-    # 加载完整数据集
-    full_dataset = NuScenesMiniDataset(
-        dataroot=config.dataroot,
-        version=config.version,
-        split='train',
-        attack_ratio=config.attack_ratio,
-        num_points=config.num_points,
-        use_cache=True
-    )
-    
-    print(f"完整数据集大小: {len(full_dataset)}")
+    Returns:
+        clients: FederatedClient列表
+    """
+    logger.log("="*60)
+    logger.log("初始化联邦客户端")
+    logger.log("="*60)
     
     # 数据分区
-    if hasattr(full_dataset, 'attack_labels'):
-        labels = full_dataset.attack_labels
-    else:
-        labels = np.zeros(len(full_dataset))
+    num_samples = len(train_dataset)
+    client_indices = partition_data_iid(num_samples, config.num_clients)
     
-    if config.num_clients == 1:
-        # 单客户端：使用全部数据
-        client_indices_list = [list(range(len(full_dataset)))]
-    else:
-        # 多客户端：根据策略分区
-        if hasattr(config, 'data_partition') and config.data_partition == 'non_iid':
-            client_indices_list = partition_data_non_iid(
-                len(full_dataset),
-                labels,
-                config.num_clients
-            )
-        else:
-            client_indices_list = partition_data_iid(
-                len(full_dataset),
-                config.num_clients
-            )
-    
-    # 创建客户端
     clients = []
-    num_malicious = int(config.num_clients * config.malicious_client_ratio)
-    print(f"配置恶意客户端数量: {num_malicious} / {config.num_clients} (比例: {config.malicious_client_ratio})")
-    
-    for client_id in range(config.num_clients):
-        # 创建客户端数据子集
-        client_indices = client_indices_list[client_id]
+    for i in range(config.num_clients):
+        logger.log(f"\n初始化客户端 {i}...")
         
-        # 如果是良性客户端 (client_id >= num_malicious)，强制将其数据标签设为0（无攻击）
-        if client_id >= num_malicious:
-            # 注意：这里直接修改 full_dataset.attack_labels 会影响所有使用该索引的客户端
-            # 但因为 indices 是不重叠的，所以没问题。
-            # 为了更安全，我们可以在创建 Subset 后，在客户端内部处理，或者在这里修改。
-            # 既然用户要求“简单改”，我们直接在分配时处理。
-            for idx in client_indices:
-                full_dataset.attack_labels[idx] = 0
-                full_dataset.attack_types[idx] = None
-        
-        client_dataset = Subset(full_dataset, client_indices)
-        
-        # 创建数据加载器
+        # 创建客户端专属数据加载器
+        client_dataset = Subset(train_dataset, client_indices[i])
         client_loader = DataLoader(
             client_dataset,
             batch_size=config.batch_size,
@@ -325,330 +124,634 @@ def init_clients(config: FederatedConfig) -> List[FederatedClient]:
             pin_memory=True
         )
         
-        # 创建客户端模型
-        client_model = Qwen3VLDefenseSystem(
-            pointcloud_dim=config.pointcloud_dim,
-            qwen_hidden_dim=config.qwen_hidden_dim,
-            model_name=config.model_path
-        )
+        logger.log(f"  - 数据量: {len(client_indices[i])} 样本")
         
-        # 创建客户端
+        # 创建客户端模型（每个客户端有独立的模型实例）
+        client_model = create_model(config)
+        
+        # 创建联邦客户端
         client = FederatedClient(
-            client_id=client_id,
+            client_id=i,
             model=client_model,
             data_loader=client_loader,
-            device=config.device,
+            device=device,
             config=config
         )
         
         clients.append(client)
-        
-        print(f"✓ Client {client_id}: {len(client_indices)} 样本")
-    
-    print(f"✓ 所有客户端初始化完成")
+        logger.log(f"  - 客户端 {i} 初始化完成")
     
     return clients
 
 
+def setup_server(
+    config: FederatedConfig,
+    train_dataset,
+    device: str,
+    logger: FederatedLogger
+) -> FederatedServer:
+    """
+    初始化联邦服务器
+    
+    Args:
+        config: 联邦配置
+        train_dataset: 训练数据集（用于可选的服务器端更新）
+        device: 计算设备
+        logger: 日志记录器
+        
+    Returns:
+        server: FederatedServer实例
+    """
+    logger.log("\n" + "="*60)
+    logger.log("初始化联邦服务器")
+    logger.log("="*60)
+    
+    # 创建服务器模型
+    server_model = create_model(config)
+    
+    # 可选：服务器端数据加载器
+    server_loader = None
+    if config.enable_server_update:
+        # 使用部分数据作为服务器公共数据
+        num_server_samples = min(len(train_dataset) // 10, 100)
+        server_indices = np.random.choice(len(train_dataset), num_server_samples, replace=False)
+        server_dataset = Subset(train_dataset, server_indices.tolist())
+        server_loader = DataLoader(
+            server_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=config.num_workers,
+            collate_fn=custom_collate_fn,
+            pin_memory=True
+        )
+        logger.log(f"  - 服务器公共数据: {num_server_samples} 样本")
+    
+    # 创建服务器
+    server = FederatedServer(
+        model=server_model,
+        device=device,
+        config=config,
+        server_data_loader=server_loader
+    )
+    
+    logger.log("  - 服务器初始化完成")
+    
+    return server
+
 
 def run_federated_round(
     round_id: int,
-    clients: List[FederatedClient],
+    clients: list,
     server: FederatedServer,
+    config: FederatedConfig,
     comm_manager: CommunicationManager,
-    logger: FederatedLogger,
-    config: FederatedConfig
-) -> RoundMetrics:
+    logger: FederatedLogger
+) -> dict:
     """
     执行一个联邦训练回合
     
+    完整流程:
+    1. 客户端本地前向推理 → 提取logits
+    2. 计算自由能
+    3. 上传logits到服务器
+    4. 服务器计算权重并聚合
+    5. 服务器自我更新（可选）
+    6. 下发全局logits
+    7. 客户端蒸馏更新
+    
     Args:
-        round_id: 当前回合ID
+        round_id: 回合ID
         clients: 客户端列表
         server: 服务器
+        config: 配置
         comm_manager: 通信管理器
         logger: 日志记录器
-        config: 配置
         
     Returns:
-        RoundMetrics: 本轮指标
+        dict: 回合指标
     """
-    logger.log_round_start(round_id, len(clients))
+    logger.log_round_start(round_id, config.num_rounds)
     comm_manager.reset_round_stats()
     
-    # ========== 阶段1: 客户端本地推理 ==========
-    logger.log("阶段1: 客户端本地推理")
+    round_metrics = {
+        'round_id': round_id,
+        'client_metrics': [],
+        'free_energies': [],
+        'weights': [],
+    }
     
-    # 如果启用了服务器更新，使用服务器公共数据的一个 batch 进行对齐推理
-    inference_batch = None
-    if config.enable_server_update and server.server_data_loader is not None:
-        if not hasattr(server, '_data_iter') or server._data_iter is None:
-            server._data_iter = iter(server.server_data_loader)
-        try:
-            inference_batch = next(server._data_iter)
-        except StopIteration:
-            server._data_iter = iter(server.server_data_loader)
-            inference_batch = next(server._data_iter)
+    # ========== 阶段1: 客户端本地推理 + 计算自由能 ==========
+    logger.log("\n[阶段1] 客户端本地推理与自由能计算")
     
     client_logits_dict = {}
     client_labels_dict = {}
+    client_batches = {}  # 保存每个客户端的batch，用于后续蒸馏
     
     for client in clients:
-        # 如果有统一的 inference_batch，则使用它；否则使用客户端自己的数据
-        batch = inference_batch if inference_batch is not None else next(iter(client.data_loader))
+        # 获取一个batch进行推理
+        batch = next(iter(client.data_loader))
+        client_batches[client.client_id] = batch
         
         # 本地前向推理
         logits, labels, sample_ids = client.local_forward(batch)
-        
         client_logits_dict[client.client_id] = logits
         client_labels_dict[client.client_id] = labels
         
-        logger.log(f"  Client {client.client_id}: logits shape {logits.shape}")
+        # 获取服务器先验logits
+        prior_logits = server.get_prior_logits(
+            batch_size=logits.size(0),
+            num_classes=logits.size(-1) if len(logits.shape) > 1 else 1
+        )
+        
+        # 计算自由能
+        if config.free_energy_mode == "kl_entropy":
+            free_energy = client.compute_free_energy(
+                logits=logits,
+                server_prior_logits=prior_logits
+            )
+        else:  # ce_entropy
+            free_energy = client.compute_free_energy(
+                logits=logits,
+                labels=labels
+            )
+        #print(f"    Free Energies: {list(free_energies.values())}")
+        
+        round_metrics['free_energies'].append(free_energy)
+        
+        logger.log(f"  客户端 {client.client_id}: logits shape={logits.shape}, F={free_energy:.4f}")
     
     # ========== 阶段2: 上传logits到服务器 ==========
-    logger.log("阶段2: 上传logits到服务器")
+    logger.log("\n[阶段2] 上传logits到服务器")
     
-    # 模拟序列化和传输（统计通信量）
     for client_id, logits in client_logits_dict.items():
-        _ = comm_manager.serialize_logits(logits)
+        # 序列化（统计通信量）
+        serialized = comm_manager.serialize_logits(logits)
+        logger.log(f"  客户端 {client_id} 上传: {len(serialized)/1024:.2f} KB")
     
-    # ========== 阶段3: 服务器计算自由能和权重 ==========
-    logger.log("阶段3: 服务器计算自由能和权重")
+    # ========== 阶段3: 服务器计算权重 ==========
+    logger.log("\n[阶段3] 服务器计算客户端权重")
     
-    # 收集logits
-    client_logits_list, client_ids = server.collect_client_logits(client_logits_dict)
+    weights = server.compute_client_weights(round_metrics['free_energies'])
+    round_metrics['weights'] = weights.tolist()
+    #print(f"    Weights: {list(weights.values())}")
     
-    # 获取先验logits（用于KL方案）
-    if config.free_energy_mode == 'kl_entropy':
-        batch_size = client_logits_list[0].size(0)
-        num_classes = client_logits_list[0].size(1)
-        prior_logits = server.get_prior_logits(batch_size, num_classes)
-    else:
-        prior_logits = None
-    
-    # 计算每个客户端的自由能
-    free_energies = []
-    for i, client_id in enumerate(client_ids):
-        client = clients[client_id]
-        logits = client_logits_list[i]
-        labels = client_labels_dict[client_id]
-        
-        free_energy = client.compute_free_energy(
-            logits=logits,
-            labels=labels,
-            server_prior_logits=prior_logits
-        )
-        free_energies.append(free_energy)
-        
-        logger.log(f"  Client {client_id}: F_i = {free_energy:.4f}")
-    
-    # 计算权重
-    weights = server.compute_client_weights(free_energies)
-    
-    for i, client_id in enumerate(client_ids):
-        logger.log(f"  Client {client_id}: w_i = {weights[i]:.4f}")
+    for i, (fe, w) in enumerate(zip(round_metrics['free_energies'], weights)):
+        logger.log(f"  客户端 {i}: F={fe:.4f}, weight={w:.4f}")
     
     # ========== 阶段4: 服务器聚合logits ==========
-    logger.log("阶段4: 服务器聚合logits")
+    logger.log("\n[阶段4] 服务器聚合logits")
     
+    client_logits_list, client_ids = server.collect_client_logits(client_logits_dict)
     global_logits = server.aggregate_logits(client_logits_list, weights)
     
-    # 记录聚合统计
-    global_logits_stats = {
-        'mean': float(global_logits.mean().item()),
-        'std': float(global_logits.std().item()),
-        'max': float(global_logits.max().item()),
-        'min': float(global_logits.min().item())
-    }
-    
-    logger.log_server_aggregation(free_energies, weights, global_logits_stats)
+    stats = server.get_aggregation_stats()
+    logger.log_server_aggregation(weights, round_metrics['free_energies'], stats.get('latest', {}))
     
     # ========== 阶段5: 服务器自我更新（可选） ==========
     if config.enable_server_update:
-        logger.log("阶段5: 服务器自我更新")
-        server_metrics = server.server_update(global_logits, batch=inference_batch)
-        logger.log(f"  Server loss: {server_metrics['loss']:.4f}")
+        logger.log("\n[阶段5] 服务器自我更新")
+        # 使用聚合的全局logits进行自我蒸馏
+        # 需要一个代表性的batch
+        representative_batch = client_batches[0]
+        server_update_result = server.server_update(
+            global_logits=global_logits,
+            batch=representative_batch,
+            num_epochs=1
+        )
+        logger.log(f"  服务器更新损失: {server_update_result['loss']:.4f}")
     
-    # ========== 阶段6: 下发global_logits ==========
-    logger.log("阶段6: 下发global_logits")
+    # ========== 阶段6: 下发全局logits ==========
+    logger.log("\n[阶段6] 下发全局logits给客户端")
     
-    # 模拟序列化和传输
-    _ = comm_manager.serialize_logits(global_logits)
+    global_package = server.broadcast_global_logits(
+        global_logits=global_logits,
+        weights=weights,
+        free_energies=round_metrics['free_energies'],
+        round_id=round_id
+    )
     
-    # ========== 阶段7: 客户端本地更新 ==========
-    logger.log("阶段7: 客户端本地更新")
+    # 序列化（统计通信量）
+    serialized_global = comm_manager.serialize_logits(global_logits)
+    logger.log(f"  全局logits大小: {len(serialized_global)/1024:.2f} KB")
     
-    round_metrics = RoundMetrics(round_id=round_id)
+    # ========== 阶段7: 客户端蒸馏更新 ==========
+    logger.log("\n[阶段7] 客户端蒸馏更新")
     
     for client in clients:
         # 接收全局logits
         global_logits_local = client.receive_global_logits(global_logits)
         
-        # 本地更新 (如果使用了统一的 inference_batch，则在该 batch 上蒸馏)
-        update_metrics = client.local_update_with_distillation(
-            global_logits_local, 
-            target_batch=inference_batch
-        )
-        logger.log(f"  Client {client.client_id}: 本地更新完成 (max_batches={config.max_batches})")
-        
-        # 记录客户端指标
-        client_metrics = ClientMetrics(
-            client_id=client.client_id,
-            free_energy=free_energies[client.client_id],
-            weight=float(weights[client.client_id]),
-            local_loss=update_metrics['loss'],
-            accuracy=update_metrics['accuracy'],
-            precision=update_metrics['precision'],
-            recall=update_metrics['recall'],
-            f1_score=update_metrics['f1_score'],
-            num_samples=len(client.data_loader.dataset)
-        )
-        
-        round_metrics.client_metrics[client.client_id] = client_metrics
-        logger.log_client_metrics(client_metrics)
+        # 根据配置选择训练方式
+        if config.train_generation:
+            # 联合训练：分类 + LLM生成
+            update_result = client.local_update_with_generation_training(
+                global_logits=global_logits_local,
+                target_batch=client_batches[client.client_id],
+                num_epochs=config.local_epochs,
+                alpha=config.generation_alpha,
+                beta=config.generation_beta,
+                gamma=config.generation_gamma
+            )
+            
+            round_metrics['client_metrics'].append({
+                'client_id': client.client_id,
+                'free_energy': round_metrics['free_energies'][client.client_id],
+                'weight': weights[client.client_id],
+                'loss': update_result['total_loss'],
+                'distill_loss': update_result['distill_loss'],
+                'detect_loss': update_result['detect_loss'],
+                'defend_loss': update_result['defend_loss'],
+                'total_loss': update_result['total_loss'],
+                'accuracy': update_result['accuracy'],
+                'precision': update_result['precision'],
+                'recall': update_result['recall'],
+                'f1_score': update_result['f1_score'],
+                'fpr': update_result.get('fpr', 0.0),
+                'fnr': update_result.get('fnr', 0.0),
+                'specificity': update_result.get('specificity', 0.0),
+                'auc_roc': update_result.get('auc_roc', 0.5),
+                'auc_pr': update_result.get('auc_pr', 0.0),
+                'tp': update_result.get('tp', 0),
+                'tn': update_result.get('tn', 0),
+                'fp': update_result.get('fp', 0),
+                'fn': update_result.get('fn', 0)
+            })
+            
+            logger.log(f"  客户端 {client.client_id}: "
+                      f"蒸馏={update_result['distill_loss']:.4f}, "
+                      f"检测={update_result['detect_loss']:.4f}, "
+                      f"防御={update_result['defend_loss']:.4f}, "
+                      f"Acc={update_result['accuracy']:.4f}")
+        else:
+            # 仅分类训练
+            update_result = client.local_update_with_distillation(
+                global_logits=global_logits_local,
+                target_batch=client_batches[client.client_id],
+                num_epochs=config.local_epochs
+            )
+            
+            round_metrics['client_metrics'].append({
+                'client_id': client.client_id,
+                'free_energy': round_metrics['free_energies'][client.client_id],
+                'weight': weights[client.client_id],
+                'loss': update_result['loss'],
+                'accuracy': update_result['accuracy'],
+                'precision': update_result['precision'],
+                'recall': update_result['recall'],
+                'f1_score': update_result['f1_score'],
+                'fpr': update_result.get('fpr', 0.0),
+                'fnr': update_result.get('fnr', 0.0),
+                'specificity': update_result.get('specificity', 0.0),
+                'auc_roc': update_result.get('auc_roc', 0.5),
+                'tp': update_result.get('tp', 0),
+                'tn': update_result.get('tn', 0),
+                'fp': update_result.get('fp', 0),
+                'fn': update_result.get('fn', 0),
+                # 5分类专有指标
+                'macro_f1': update_result.get('macro_f1', 0.0),
+                'per_class_f1': update_result.get('per_class_f1', [0.0]*5)
+            })
+            
+            logger.log_client_metrics(
+                client_id=client.client_id,
+                free_energy=round_metrics['free_energies'][client.client_id],
+                weight=weights[client.client_id],
+                loss=update_result['loss'],
+                accuracy=update_result['accuracy'],
+                f1_score=update_result.get('f1_score', 0.0),
+                num_samples=len(client_batches[client.client_id]['labels'])
+            )
     
-    # ========== 阶段8: 记录通信量和指标 ==========
+    # ========== 统计通信量 ==========
     comm_stats = comm_manager.get_communication_stats()
-    round_metrics.communication_mb = comm_stats['round_mb']
-    
     logger.log_communication_stats(comm_stats)
+    round_metrics['communication'] = comm_stats
     
-    # ========== 阶段9: 全局评估 (使用公共数据集) ==========
-    if server.server_data_loader is not None:
-        logger.log("阶段9: 全局评估 (使用公共数据集)")
-        # 使用服务器模型在公共数据集上评估
-        global_metrics = server.evaluate()
-        logger.log(f"  Global Metrics: Acc={global_metrics['accuracy']:.4f}, F1={global_metrics['f1_score']:.4f}")
+    # ========== 阶段8: LLM攻击检测与防御策略生成（可选） ==========
+    if config.verbose and round_id % 3 == 0:  # 每3轮展示一次LLM输出
+        logger.log("\n[阶段8] LLM攻击检测与防御策略生成 (示例)")
         
-        # 将全局指标存入 round_metrics 以便记录
-        round_metrics.server_metrics.update({
-            'global_accuracy': global_metrics['accuracy'],
-            'global_f1': global_metrics['f1_score']
-        })
+        # 类别名称映射
+        CLASS_NAMES = ['normal', 'adversarial_patch', 'sensor_spoofing', 'physical_attack', 'data_poisoning']
+        
+        # 选择第一个客户端进行演示
+        demo_client = clients[0]
+        demo_batch = client_batches[0]
+        
+        # 显示当前batch的攻击类型分布
+        if 'attack_types' in demo_batch:
+            attack_types_in_batch = demo_batch['attack_types']
+            labels_in_batch = demo_batch['labels'].tolist()
+            logger.log(f"\n  === 当前Batch攻击情况 ===")
+            for i, (at, lb) in enumerate(zip(attack_types_in_batch, labels_in_batch)):
+                label_name = CLASS_NAMES[lb] if lb < len(CLASS_NAMES) else f'unknown_{lb}'
+                logger.log(f"    样本{i}: 标签={lb} ({label_name})")
+        
+        try:
+            # 完整推理：分类 + 攻击检测 + 防御策略
+            inference_results = demo_client.full_inference(demo_batch)
+            
+            logger.log(f"\n  === 样本推理结果 ===")
+            
+            for i, det_result in enumerate(inference_results['detection_results']):
+                # 获取真实标签
+                true_label = demo_batch['labels'][i].item()
+                true_attack_type = demo_batch['attack_types'][i] if 'attack_types' in demo_batch else 'unknown'
+                
+                # 获取预测结果
+                pred_label = inference_results['predictions'][i]
+                pred_class_name = CLASS_NAMES[pred_label] if pred_label < len(CLASS_NAMES) else f'unknown_{pred_label}'
+                
+                logger.log(f"\n  样本 {i+1}:")
+                logger.log(f"    【真实】: 类别={true_label} ({true_attack_type})")
+                logger.log(f"    【预测】: 类别={pred_label} ({pred_class_name})")
+                logger.log(f"    【置信度】: {inference_results['confidence'][i]:.4f}")
+                logger.log(f"    【正确】: {'✓' if pred_label == true_label else '✗'}")
+                
+                # LLM检测结果
+                logger.log(f"    LLM检测结果:")
+                logger.log(f"      - 是否攻击: {det_result.get('is_attack', 'N/A')}")
+                logger.log(f"      - 攻击类型: {det_result.get('attack_type', 'N/A')}")
+                logger.log(f"      - 风险等级: {det_result.get('risk_level', 'N/A')}")
+                logger.log(f"      - 置信度: {det_result.get('confidence', 'N/A')}")
+                
+                # 分析内容（截取前200字符）
+                analysis = det_result.get('analysis', '')
+                if analysis:
+                    logger.log(f"      - 分析: {analysis[:200]}...")
+                
+                # 防御策略（截取前300字符）
+                defense = inference_results['defense_strategies'][i]
+                if defense and defense != '无需防御 - 未检测到攻击':
+                    logger.log(f"    防御策略: {defense[:300]}...")
+                else:
+                    logger.log(f"    防御策略: {defense}")
+                    
+        except Exception as e:
+            logger.log(f"  LLM推理出错: {str(e)}")
+            logger.log(f"  (这可能是因为模型未完全加载或配置问题)")
     
-    # 计算平均指标
-    avg_metrics = {
-        'avg_accuracy': np.mean([cm.accuracy for cm in round_metrics.client_metrics.values()]),
-        'avg_f1_score': np.mean([cm.f1_score for cm in round_metrics.client_metrics.values()]),
-        'avg_free_energy': np.mean(free_energies),
-        'avg_weight': np.mean(weights)
-    }
-    
-    if 'global_f1' in round_metrics.server_metrics:
-        avg_metrics['global_f1'] = round_metrics.server_metrics['global_f1']
-    
+    # ========== 回合总结 ==========
+    avg_metrics = aggregate_metrics(round_metrics['client_metrics'])
     logger.log_round_end(round_id, avg_metrics)
+    round_metrics['avg_metrics'] = avg_metrics
     
     return round_metrics
 
 
-def main():
-    """主函数"""
-    print("=" * 80)
-    print("联邦学习训练 - 基于主动推理的Qwen3-VL攻击检测系统")
-    print("=" * 80)
+def run_federated_training(config: FederatedConfig):
+    """
+    执行完整的联邦训练
     
-    # 解析参数
-    args = parse_args()
-    config = create_config_from_args(args)
+    Args:
+        config: 联邦学习配置
+    """
+    # 设置设备
+    device = config.device if torch.cuda.is_available() else 'cpu'
+    print(f"使用设备: {device}")
     
-    print("\n配置信息:")
-    print(config)
-    
-    # 创建保存目录
+    # 创建日志目录
     os.makedirs(config.log_dir, exist_ok=True)
     os.makedirs(config.save_dir, exist_ok=True)
     
-    # 保存配置
-    config.save(os.path.join(config.save_dir, 'config.json'))
-    
     # 初始化日志记录器
     logger = FederatedLogger(config.log_dir, config.verbose)
-    logger.log("联邦学习训练开始")
-    logger.log(f"配置: {config.to_dict()}")
+    logger.log("="*60)
+    logger.log("联邦学习 + 主动推理 训练系统")
+    logger.log("="*60)
+    logger.log(f"\n配置:\n{config}")
     
     # 初始化通信管理器
     comm_manager = CommunicationManager()
     
-    # 初始化服务器和客户端
-    server = init_server(config)
-    clients = init_clients(config)
+    # 加载数据集
+    logger.log("\n加载数据集...")
     
-    # 主训练循环
-    print("\n" + "=" * 80)
-    print("开始联邦训练")
-    print("=" * 80)
+    # 选择数据集类型
+    if config.use_attack_dataset and ATTACK_DATASET_AVAILABLE:
+        logger.log("使用增强攻击数据集（真实攻击生成）")
+        
+        # 攻击配置
+        attack_config = {
+            'attack_ratio': config.attack_ratio,
+            'attack_weights': {
+                'adversarial_patch': 0.25,
+                'sensor_spoofing': 0.25,
+                'physical_attack': 0.25,
+                'data_poisoning': 0.25
+            }
+        }
+        
+        train_dataset = create_attack_dataset(
+            dataroot=config.dataroot,
+            version=config.version,
+            split='train',
+            attack_ratio=config.attack_ratio,
+            num_points=config.num_points,
+            use_synthetic=config.use_synthetic_data,
+            num_synthetic_samples=config.num_synthetic_samples,
+            attack_config=attack_config
+        )
+        collate_fn = attack_collate_fn
+    else:
+        logger.log("使用原始数据集（简单攻击标记）")
+        train_dataset = NuScenesMiniDataset(
+            dataroot=config.dataroot,
+            version=config.version,
+            split='train',
+            attack_ratio=config.attack_ratio,
+            num_points=config.num_points,
+            use_cache=True
+        )
+        collate_fn = custom_collate_fn
     
-    best_f1 = 0.0
-    best_round = 0
+    train_dataset.get_statistics()
     
-    for round_id in range(1, config.num_rounds + 1):
-        # 执行一个联邦回合
+    # 初始化客户端
+    clients = setup_clients(config, train_dataset, device, logger)
+    
+    # 初始化服务器
+    server = setup_server(config, train_dataset, device, logger)
+    
+    # 保存配置
+    config.save(os.path.join(config.save_dir, 'config.json'))
+    
+    # ========== 联邦训练循环 ==========
+    logger.log("\n" + "="*60)
+    logger.log("开始联邦训练")
+    logger.log("="*60)
+    
+    all_round_metrics = []
+    best_avg_f1 = 0.0
+    
+    for round_id in range(config.num_rounds):
+        # 执行一轮联邦训练
         round_metrics = run_federated_round(
             round_id=round_id,
             clients=clients,
             server=server,
+            config=config,
             comm_manager=comm_manager,
-            logger=logger,
-            config=config
+            logger=logger
         )
         
-        # 添加到日志
+        all_round_metrics.append(round_metrics)
         logger.add_round_metrics(round_metrics)
         
-        # 计算平均F1分数
-        avg_f1 = np.mean([cm.f1_score for cm in round_metrics.client_metrics.values()])
-        
-        # 保存最佳模型
-        if avg_f1 > best_f1:
-            best_f1 = avg_f1
-            best_round = round_id
-            
-            # 保存服务器模型
-            server_model_path = os.path.join(config.save_dir, 'best_server_model.pth')
-            server.save_model(server_model_path)
-            logger.log(f"✓ 保存最佳服务器模型 (Round {round_id}, F1: {best_f1:.4f})")
-            
-            # 保存所有客户端模型
+        # 检查是否是最佳模型
+        avg_f1 = round_metrics['avg_metrics'].get('avg_f1_score', 0)
+        if avg_f1 > best_avg_f1:
+            best_avg_f1 = avg_f1
+            # 保存最佳服务器模型
+            server.save_model(os.path.join(config.save_dir, 'best_server_model.pth'))
+            # 保存最佳客户端模型
             for client in clients:
-                client_model_path = os.path.join(
-                    config.save_dir,
-                    f'best_client_{client.client_id}_model.pth'
+                torch.save(
+                    client.get_model_state(),
+                    os.path.join(config.save_dir, f'best_client_{client.client_id}_model.pth')
                 )
-                torch.save(client.get_model_state(), client_model_path)
+            logger.log(f"  ✓ 保存最佳模型 (Avg F1: {best_avg_f1:.4f})")
         
         # 定期保存检查点
-        if round_id % 5 == 0:
-            checkpoint_path = os.path.join(
-                config.save_dir,
-                f'checkpoint_round_{round_id}.pth'
-            )
+        if (round_id + 1) % 5 == 0:
+            checkpoint_path = os.path.join(config.save_dir, f'checkpoint_round_{round_id+1}.pth')
             server.save_model(checkpoint_path)
-            logger.log(f"✓ 保存检查点: Round {round_id}")
+            logger.log(f"  ✓ 保存检查点: {checkpoint_path}")
     
-    # 训练完成
-    print("\n" + "=" * 80)
-    print("联邦训练完成!")
-    print("=" * 80)
-    print(f"最佳F1分数: {best_f1:.4f} (Round {best_round})")
+    # ========== 训练完成 ==========
+    logger.log("\n" + "="*60)
+    logger.log("联邦训练完成!")
+    logger.log("="*60)
+    logger.log(f"最佳平均F1分数: {best_avg_f1:.4f}")
     
-    # 保存指标和绘制曲线
+    # 保存所有指标
     logger.save_metrics()
+    
+    # 绘制训练曲线
     logger.plot_training_curves()
     
-    # 最终评估
-    print("\n最终评估:")
-    for client in clients:
-        eval_metrics = client.evaluate()
-        print(f"  Client {client.client_id}: "
-              f"Acc={eval_metrics['accuracy']:.4f}, "
-              f"F1={eval_metrics['f1_score']:.4f}")
+    # 最终通信统计
+    final_comm_stats = comm_manager.get_communication_stats()
+    logger.log(f"\n总通信量: {final_comm_stats['total_mb']:.2f} MB")
     
-    logger.log("联邦学习训练结束")
+    return all_round_metrics
+
+
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='联邦学习训练脚本')
     
-    print("\n日志和模型已保存到:")
-    print(f"  日志目录: {config.log_dir}")
-    print(f"  模型目录: {config.save_dir}")
+    # 基础参数
+    parser.add_argument('--config', type=str, default=None, help='配置文件路径')
+    parser.add_argument('--num_clients', type=int, default=3, help='客户端数量')
+    parser.add_argument('--num_rounds', type=int, default=10, help='联邦训练轮数')
+    parser.add_argument('--local_epochs', type=int, default=1, help='本地训练轮数')
+    
+    # 主动推理参数
+    parser.add_argument('--free_energy_mode', type=str, default='ce_entropy',
+                        choices=['kl_entropy', 'ce_entropy'], help='自由能计算模式')
+    parser.add_argument('--tau', type=float, default=1.0, help='权重计算温度')
+    parser.add_argument('--lambda_entropy', type=float, default=0.1, help='KL方案熵权重')
+    parser.add_argument('--gamma_entropy', type=float, default=0.1, help='CE方案熵权重')
+    
+    # 蒸馏参数
+    parser.add_argument('--alpha', type=float, default=0.5, help='交叉熵权重')
+    parser.add_argument('--beta', type=float, default=0.5, help='KL散度权重')
+    parser.add_argument('--temperature', type=float, default=3.0, help='蒸馏温度')
+    
+    # LLM生成训练参数
+    parser.add_argument('--train_generation', action='store_true', 
+                        help='启用LLM生成任务训练（检测+防御）')
+    parser.add_argument('--generation_alpha', type=float, default=1.0, 
+                        help='分类/蒸馏损失权重')
+    parser.add_argument('--generation_beta', type=float, default=0.3, 
+                        help='检测生成损失权重')
+    parser.add_argument('--generation_gamma', type=float, default=0.3, 
+                        help='防御生成损失权重')
+    
+    # 服务器参数
+    parser.add_argument('--enable_server_update', action='store_true', help='启用服务器更新')
+    parser.add_argument('--server_lr', type=float, default=1e-5, help='服务器学习率')
+    
+    # 数据参数
+    parser.add_argument('--dataroot', type=str, 
+                        default=r'/root/autodl-tmp/zrj/data/nusences',
+                        help='nuScenes数据集路径')
+    parser.add_argument('--batch_size', type=int, default=1, help='批次大小')
+    parser.add_argument('--attack_ratio', type=float, default=0.5, help='攻击样本比例')
+    
+    # 攻击数据集参数
+    parser.add_argument('--use_attack_dataset', action='store_true', default=True,
+                        help='使用真实攻击生成数据集')
+    parser.add_argument('--no_attack_dataset', action='store_true',
+                        help='不使用攻击生成数据集（使用原始数据集）')
+    parser.add_argument('--use_synthetic_data', action='store_true',
+                        help='使用合成数据（无需NuScenes数据集）')
+    parser.add_argument('--num_synthetic_samples', type=int, default=1000,
+                        help='合成数据样本数量')
+    
+    # 模型参数
+    parser.add_argument('--model_path', type=str,
+                        default=r'Qwen/Qwen3-VL-2B-Instruct',
+                        help='Qwen3-VL模型路径')
+    
+    # 设备和日志
+    parser.add_argument('--device', type=str, default='cuda', help='计算设备')
+    parser.add_argument('--log_dir', type=str, default='./logs_federated', help='日志目录')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints_federated', help='保存目录')
+    parser.add_argument('--verbose', action='store_true', help='详细输出')
+    
+    return parser.parse_args()
+
+
+def main():
+    """主函数"""
+    args = parse_args()
+    
+    # 加载配置
+    if args.config:
+        config = FederatedConfig.load(args.config)
+        print(f"从文件加载配置: {args.config}")
+    else:
+        # 处理攻击数据集参数
+        use_attack_dataset = args.use_attack_dataset and not args.no_attack_dataset
+        
+        # 从命令行参数创建配置
+        config = FederatedConfig(
+            num_clients=args.num_clients,
+            num_rounds=args.num_rounds,
+            local_epochs=args.local_epochs,
+            free_energy_mode=args.free_energy_mode,
+            tau=args.tau,
+            lambda_entropy=args.lambda_entropy,
+            gamma_entropy=args.gamma_entropy,
+            alpha=args.alpha,
+            beta=args.beta,
+            temperature=args.temperature,
+            train_generation=args.train_generation,
+            generation_alpha=args.generation_alpha,
+            generation_beta=args.generation_beta,
+            generation_gamma=args.generation_gamma,
+            enable_server_update=args.enable_server_update,
+            server_lr=args.server_lr,
+            dataroot=args.dataroot,
+            batch_size=args.batch_size,
+            attack_ratio=args.attack_ratio,
+            use_attack_dataset=use_attack_dataset,
+            use_synthetic_data=args.use_synthetic_data,
+            num_synthetic_samples=args.num_synthetic_samples,
+            model_path=args.model_path,
+            device=args.device,
+            log_dir=args.log_dir,
+            save_dir=args.save_dir,
+            verbose=args.verbose
+        )
+    
+    # 验证配置
+    config.validate()
+    
+    # 运行联邦训练
+    run_federated_training(config)
 
 
 if __name__ == "__main__":

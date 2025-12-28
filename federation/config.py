@@ -21,12 +21,18 @@ class FederatedConfig:
     # ========== 模型参数 ==========
     model_path: str = "/home/sutongtong/wwt/model/Qwen3-VL-2B-Instruct"
     pointcloud_dim: int = 1024
-    qwen_hidden_dim: int = 3072
+    qwen_hidden_dim: Optional[int] = None  # None表示自动检测
     
     # ========== 蒸馏损失参数 ==========
     alpha: float = 0.5  # 交叉熵权重
     beta: float = 0.5   # KL散度权重
     temperature: float = 3.0  # 蒸馏温度T
+    
+    # ========== LLM生成训练参数 ==========
+    train_generation: bool = False  # 是否训练LLM生成任务
+    generation_alpha: float = 1.0   # 分类/蒸馏损失权重
+    generation_beta: float = 0.3    # 检测生成损失权重
+    generation_gamma: float = 0.3   # 防御生成损失权重
     
     # ========== 主动推理参数 ==========
     free_energy_mode: str = "kl_entropy"  # "kl_entropy" 或 "ce_entropy"
@@ -44,13 +50,19 @@ class FederatedConfig:
     # ========== 数据参数 ==========
     dataroot: str = "/home/sutongtong/LanTu_team3/dataset/nuScenes/train"
     version: str = "v1.0-trainval"
-    batch_size: int = 1
+    batch_size: int = 3
     max_batches: int = 0  # 每轮每客户端最大训练batch数，0表示跑完整个epoch
     server_max_batches: int = 0  # 服务器公共数据集最大batch数，0表示跑完整个数据集
     num_workers: int = 2
     attack_ratio: float = 0.3
     malicious_client_ratio: float = 0.0  # 恶意客户端比例 (0.0-1.0)
     num_points: int = 2048
+    
+    # ========== 攻击数据集参数 ==========
+    use_attack_dataset: bool = True   # 是否使用真实攻击生成数据集
+    use_synthetic_data: bool = False  # 是否使用合成数据（无需NuScenes）
+    num_synthetic_samples: int = 1000 # 合成数据样本数
+    num_classes: int = 5              # 分类类别数 (1正常 + 4攻击)
     
     # ========== 训练参数 ==========
     lr: float = 1e-4

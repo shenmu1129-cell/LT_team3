@@ -37,17 +37,31 @@ class RoundMetrics:
     client_metrics: Dict[int, ClientMetrics] = field(default_factory=dict)
     server_metrics: Dict[str, float] = field(default_factory=dict)
     communication_mb: float = 0.0
+    free_energies: List[float] = field(default_factory=list)
+    weights: List[float] = field(default_factory=list)
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
+        # 处理client_metrics，可能是dict或list
+        if isinstance(self.client_metrics, dict):
+            cm_list = [
+                cm.to_dict() if hasattr(cm, 'to_dict') else cm 
+                for cm in self.client_metrics.values()
+            ]
+        else:
+            cm_list = [
+                cm.to_dict() if hasattr(cm, 'to_dict') else cm 
+                for cm in self.client_metrics
+            ]
+        
         return {
             'round_id': self.round_id,
-            'client_metrics': {
-                cid: cm.to_dict() for cid, cm in self.client_metrics.items()
-            },
+            'client_metrics': cm_list,
             'server_metrics': self.server_metrics,
             'communication_mb': self.communication_mb,
+            'free_energies': self.free_energies,
+            'weights': self.weights,
             'timestamp': self.timestamp
         }
 
@@ -104,22 +118,47 @@ class FederatedLogger:
         self.log(f"Round {round_id} Started - {num_clients} clients")
         self.log("=" * 80)
     
-    def log_client_metrics(self, client_metrics: ClientMetrics) -> None:
-        """记录客户端指标"""
+    def log_client_metrics(self, client_metrics: Any = None, **kwargs) -> None:
+        """
+        记录客户端指标
+        
+        可以传入 ClientMetrics 对象，或者直接传入关键字参数 (client_id, free_energy, weight, loss, accuracy, f1_score, num_samples)
+        """
+        if client_metrics is not None and hasattr(client_metrics, 'client_id'):
+            # 处理传入 ClientMetrics 对象的情况
+            cid = client_metrics.client_id
+            fe = client_metrics.free_energy
+            w = client_metrics.weight
+            loss = client_metrics.local_loss
+            acc = client_metrics.accuracy
+            f1 = client_metrics.f1_score
+            n = getattr(client_metrics, 'num_samples', 0)
+        else:
+            # 处理传入关键字参数的情况
+            cid = kwargs.get('client_id', 'unknown')
+            fe = kwargs.get('free_energy', 0.0)
+            w = kwargs.get('weight', 0.0)
+            # 兼容 loss 或 local_loss
+            loss = kwargs.get('loss', kwargs.get('local_loss', 0.0))
+            acc = kwargs.get('accuracy', 0.0)
+            f1 = kwargs.get('f1_score', kwargs.get('f1', 0.0))
+            n = kwargs.get('num_samples', 0)
+
         msg = (
-            f"Client {client_metrics.client_id}: "
-            f"F={client_metrics.free_energy:.4f}, "
-            f"w={client_metrics.weight:.4f}, "
-            f"loss={client_metrics.local_loss:.4f}, "
-            f"acc={client_metrics.accuracy:.4f}, "
-            f"f1={client_metrics.f1_score:.4f}"
+            f"Client {cid}: "
+            f"F={fe:.4f}, "
+            f"w={w:.4f}, "
+            f"loss={loss:.4f}, "
+            f"acc={acc:.4f}, "
+            f"f1={f1:.4f}, "
+            f"n={n}"
         )
         self.log(msg)
     
     def log_server_aggregation(
         self,
-        free_energies: List[float],
         weights: np.ndarray,
+        free_energies: List[float],
         global_logits_stats: Dict[str, float]
     ) -> None:
         """记录服务器聚合信息"""
@@ -127,8 +166,15 @@ class FederatedLogger:
         self.log(f"  Free Energies: {[f'{f:.4f}' for f in free_energies]}")
         self.log(f"  Weights: {[f'{w:.4f}' for w in weights]}")
         self.log(f"  Global Logits Stats:")
+        # for key, value in global_logits_stats.items():
+        #     self.log(f"    {key}: {value:.4f}")
         for key, value in global_logits_stats.items():
-            self.log(f"    {key}: {value:.4f}")
+            if isinstance(value, (list, tuple)):
+                self.log(f"    {key}: {value}")
+            elif isinstance(value, (int, float)):
+                self.log(f"    {key}: {value:.4f}")
+            else:
+                self.log(f"    {key}: {value}")
     
     def log_communication_stats(self, comm_stats: Dict[str, float]) -> None:
         """记录通信统计"""
@@ -146,9 +192,46 @@ class FederatedLogger:
             self.log(f"    {key}: {value:.4f}")
         self.log("=" * 80 + "\n")
     
-    def add_round_metrics(self, round_metrics: RoundMetrics) -> None:
-        """添加回合指标"""
-        self.round_metrics_list.append(round_metrics)
+    def add_round_metrics(self, round_metrics) -> None:
+        """添加回合指标，支持RoundMetrics对象或字典"""
+        if isinstance(round_metrics, RoundMetrics):
+            self.round_metrics_list.append(round_metrics)
+        elif isinstance(round_metrics, dict):
+            # 从字典创建RoundMetrics对象
+            rm = RoundMetrics(
+                round_id=round_metrics.get('round_id', len(self.round_metrics_list)),
+                free_energies=round_metrics.get('free_energies', []),
+                weights=round_metrics.get('weights', [])
+            )
+            
+            # 处理client_metrics
+            client_metrics_list = round_metrics.get('client_metrics', [])
+            for i, cm in enumerate(client_metrics_list):
+                if isinstance(cm, dict):
+                    client_id = cm.get('client_id', i)
+                    rm.client_metrics[client_id] = ClientMetrics(
+                        client_id=client_id,
+                        free_energy=cm.get('free_energy', 0.0),
+                        weight=cm.get('weight', 0.0),
+                        local_loss=cm.get('loss', cm.get('distill_loss', cm.get('total_loss', 0.0))),
+                        accuracy=cm.get('accuracy', 0.0),
+                        precision=cm.get('precision', 0.0),
+                        recall=cm.get('recall', 0.0),
+                        f1_score=cm.get('f1_score', 0.0),
+                        num_samples=cm.get('num_samples', 0)
+                    )
+                elif isinstance(cm, ClientMetrics):
+                    rm.client_metrics[cm.client_id] = cm
+            
+            # 如果free_energies/weights为空，尝试从client_metrics中获取
+            if not rm.free_energies and rm.client_metrics:
+                rm.free_energies = [cm.free_energy for cm in rm.client_metrics.values()]
+            if not rm.weights and rm.client_metrics:
+                rm.weights = [cm.weight for cm in rm.client_metrics.values()]
+            
+            self.round_metrics_list.append(rm)
+        else:
+            self.log(f"Warning: Unknown round_metrics type: {type(round_metrics)}", "WARNING")
     
     def save_metrics(self) -> None:
         """保存所有指标到JSON文件"""
@@ -173,22 +256,45 @@ class FederatedLogger:
         all_free_energies = []
         
         for rm in self.round_metrics_list:
-            for cm in rm.client_metrics.values():
-                all_accuracies.append(cm.accuracy)
-                all_f1_scores.append(cm.f1_score)
-                all_free_energies.append(cm.free_energy)
+            if isinstance(rm.client_metrics, dict):
+                for cm in rm.client_metrics.values():
+                    if hasattr(cm, 'accuracy'):
+                        all_accuracies.append(cm.accuracy)
+                        all_f1_scores.append(cm.f1_score)
+                        all_free_energies.append(cm.free_energy)
+                    elif isinstance(cm, dict):
+                        all_accuracies.append(cm.get('accuracy', 0))
+                        all_f1_scores.append(cm.get('f1_score', 0))
+                        all_free_energies.append(cm.get('free_energy', 0))
+        
+        if not all_accuracies:
+            return {'total_rounds': len(self.round_metrics_list)}
+        
+        # 获取最后一轮的指标
+        last_rm = self.round_metrics_list[-1]
+        if isinstance(last_rm.client_metrics, dict) and last_rm.client_metrics:
+            last_accs = []
+            last_f1s = []
+            for cm in last_rm.client_metrics.values():
+                if hasattr(cm, 'accuracy'):
+                    last_accs.append(cm.accuracy)
+                    last_f1s.append(cm.f1_score)
+                elif isinstance(cm, dict):
+                    last_accs.append(cm.get('accuracy', 0))
+                    last_f1s.append(cm.get('f1_score', 0))
+            final_acc = float(np.mean(last_accs)) if last_accs else 0
+            final_f1 = float(np.mean(last_f1s)) if last_f1s else 0
+        else:
+            final_acc = 0
+            final_f1 = 0
         
         return {
             'total_rounds': len(self.round_metrics_list),
-            'avg_accuracy': float(np.mean(all_accuracies)),
-            'avg_f1_score': float(np.mean(all_f1_scores)),
-            'avg_free_energy': float(np.mean(all_free_energies)),
-            'final_round_accuracy': float(np.mean([
-                cm.accuracy for cm in self.round_metrics_list[-1].client_metrics.values()
-            ])),
-            'final_round_f1': float(np.mean([
-                cm.f1_score for cm in self.round_metrics_list[-1].client_metrics.values()
-            ]))
+            'avg_accuracy': float(np.mean(all_accuracies)) if all_accuracies else 0,
+            'avg_f1_score': float(np.mean(all_f1_scores)) if all_f1_scores else 0,
+            'avg_free_energy': float(np.mean(all_free_energies)) if all_free_energies else 0,
+            'final_round_accuracy': final_acc,
+            'final_round_f1': final_f1
         }
     
     def plot_training_curves(self) -> None:

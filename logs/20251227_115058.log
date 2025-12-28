@@ -1,0 +1,15 @@
+警告: 攻击数据集模块未找到，将使用原始数据集
+使用设备: cuda
+初始化NuScenes数据集: train
+Traceback (most recent call last):
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 757, in <module>
+    main()
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 753, in main
+    run_federated_training(config)
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 557, in run_federated_training
+    train_dataset = NuScenesMiniDataset(
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/test_local_train_mini_qwen3vl_fixed.py", line 710, in __init__
+    self.nusc = NuScenes(version=version, dataroot=dataroot, verbose=False)
+  File "/home/sutongtong/anaconda3/envs/wwt310/lib/python3.10/site-packages/nuscenes/nuscenes.py", line 65, in __init__
+    assert osp.exists(self.table_root), 'Database version not found: {}'.format(self.table_root)
+AssertionError: Database version not found: /root/autodl-tmp/zrj/data/nusences/v1.0-trainval

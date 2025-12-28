@@ -96,44 +96,199 @@ def align_logits(
 
 def compute_metrics(
     predictions: np.ndarray,
-    labels: np.ndarray
+    labels: np.ndarray,
+    probabilities: np.ndarray = None,
+    num_classes: int = 5
 ) -> Dict[str, float]:
     """
-    计算分类指标
+    计算5分类指标
     
     Args:
-        predictions: 预测标签 [N]
-        labels: 真实标签 [N]
+        predictions: 预测标签 [N] (0-4)
+        labels: 真实标签 [N] (0-4)
+        probabilities: 预测概率 [N] 或 [N, num_classes]（用于计算AUC）
+        num_classes: 类别数，默认5
         
     Returns:
-        dict: 包含accuracy, precision, recall, f1_score的字典
+        dict: 包含accuracy, macro_f1, per_class指标, 以及二分类视角的fpr/fnr等
     """
     # 确保是numpy数组
     predictions = np.array(predictions)
     labels = np.array(labels)
     
-    # 计算混淆矩阵元素
-    tp = np.sum((predictions == 1) & (labels == 1))
-    tn = np.sum((predictions == 0) & (labels == 0))
-    fp = np.sum((predictions == 1) & (labels == 0))
-    fn = np.sum((predictions == 0) & (labels == 1))
+    # ========== 5分类指标 ==========
+    # 总体准确率
+    accuracy = float(np.mean(predictions == labels))
     
-    # 计算指标
-    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    # 每个类别的precision, recall, f1
+    per_class_precision = []
+    per_class_recall = []
+    per_class_f1 = []
     
-    return {
+    for c in range(num_classes):
+        tp = np.sum((predictions == c) & (labels == c))
+        fp = np.sum((predictions == c) & (labels != c))
+        fn = np.sum((predictions != c) & (labels == c))
+        
+        precision_c = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall_c = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1_c = 2 * precision_c * recall_c / (precision_c + recall_c) if (precision_c + recall_c) > 0 else 0.0
+        
+        per_class_precision.append(float(precision_c))
+        per_class_recall.append(float(recall_c))
+        per_class_f1.append(float(f1_c))
+    
+    # 宏平均
+    macro_precision = float(np.mean(per_class_precision))
+    macro_recall = float(np.mean(per_class_recall))
+    macro_f1 = float(np.mean(per_class_f1))
+    
+    # 加权平均（按类别样本数加权）
+    class_counts = [np.sum(labels == c) for c in range(num_classes)]
+    total_samples = sum(class_counts)
+    
+    if total_samples > 0:
+        weighted_precision = sum(p * c for p, c in zip(per_class_precision, class_counts)) / total_samples
+        weighted_recall = sum(r * c for r, c in zip(per_class_recall, class_counts)) / total_samples
+        weighted_f1 = sum(f * c for f, c in zip(per_class_f1, class_counts)) / total_samples
+    else:
+        weighted_precision = weighted_recall = weighted_f1 = 0.0
+    
+    # ========== 二分类视角（正常 vs 攻击）==========
+    # 0 = normal, 1-4 = attack
+    binary_pred = (predictions > 0).astype(int)  # 预测是否为攻击
+    binary_label = (labels > 0).astype(int)  # 真实是否为攻击
+    
+    tp = np.sum((binary_pred == 1) & (binary_label == 1))  # 正确检测攻击
+    tn = np.sum((binary_pred == 0) & (binary_label == 0))  # 正确识别正常
+    fp = np.sum((binary_pred == 1) & (binary_label == 0))  # 误报（正常→攻击）
+    fn = np.sum((binary_pred == 0) & (binary_label == 1))  # 漏报（攻击→正常）
+    
+    # 二分类指标
+    binary_accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
+    binary_precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    binary_recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0  # 检测率
+    binary_f1 = 2 * binary_precision * binary_recall / (binary_precision + binary_recall) if (binary_precision + binary_recall) > 0 else 0.0
+    
+    # 误报率 (FPR) - 正常样本被误判为攻击的比例
+    fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+    
+    # 漏报率 (FNR) - 攻击样本被漏检的比例
+    fnr = fn / (fn + tp) if (fn + tp) > 0 else 0.0
+    
+    # 特异度 (Specificity) = 1 - FPR
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    
+    metrics = {
+        # 5分类指标
         'accuracy': float(accuracy),
-        'precision': float(precision),
-        'recall': float(recall),
-        'f1_score': float(f1_score),
+        'macro_precision': float(macro_precision),
+        'macro_recall': float(macro_recall),
+        'macro_f1': float(macro_f1),
+        'weighted_precision': float(weighted_precision),
+        'weighted_recall': float(weighted_recall),
+        'weighted_f1': float(weighted_f1),
+        
+        # 每个类别的指标
+        'per_class_precision': per_class_precision,
+        'per_class_recall': per_class_recall,
+        'per_class_f1': per_class_f1,
+        
+        # 二分类视角（正常 vs 攻击）
+        'binary_accuracy': float(binary_accuracy),
+        'precision': float(binary_precision),  # 保持兼容性
+        'recall': float(binary_recall),  # 检测率
+        'f1_score': float(binary_f1),  # 保持兼容性
+        'fpr': float(fpr),  # 误报率
+        'fnr': float(fnr),  # 漏报率
+        'specificity': float(specificity),
+        
+        # 混淆矩阵元素（二分类视角）
         'tp': int(tp),
         'tn': int(tn),
         'fp': int(fp),
         'fn': int(fn)
     }
+    
+    # 计算AUC-ROC（如果提供了概率）
+    if probabilities is not None:
+        try:
+            from sklearn.metrics import roc_auc_score
+            probabilities = np.array(probabilities)
+            
+            # 如果是攻击概率（1维）
+            if probabilities.ndim == 1:
+                attack_probs = probabilities
+            # 如果是5分类概率（2维），计算攻击概率 = 1 - P(normal)
+            elif probabilities.ndim == 2:
+                attack_probs = 1 - probabilities[:, 0]
+            else:
+                attack_probs = probabilities
+            
+            if len(np.unique(binary_label)) > 1:
+                auc_roc = roc_auc_score(binary_label, attack_probs)
+                metrics['auc_roc'] = float(auc_roc)
+            else:
+                metrics['auc_roc'] = 0.5
+        except Exception as e:
+            metrics['auc_roc'] = 0.5
+    
+    return metrics
+
+
+def compute_attack_type_metrics(
+    predictions: np.ndarray, 
+    labels: np.ndarray,
+    attack_types: list
+) -> Dict[str, Dict[str, float]]:
+    """
+    计算各攻击类型的检测指标
+    
+    Args:
+        predictions: 预测标签（是否攻击）
+        labels: 真实标签
+        attack_types: 真实攻击类型列表
+    
+    Returns:
+        dict: 每种攻击类型的检测率
+    """
+    attack_categories = ['adversarial_patch', 'sensor_spoofing', 'physical_attack', 'data_poisoning']
+    
+    predictions = np.array(predictions)
+    labels = np.array(labels)
+    
+    results = {}
+    
+    for attack_cat in attack_categories:
+        # 找出该类型攻击的样本
+        mask = np.array([at == attack_cat if at else False for at in attack_types])
+        
+        if np.sum(mask) == 0:
+            results[attack_cat] = {'detection_rate': 0.0, 'count': 0}
+            continue
+        
+        # 该类型攻击的检测率
+        detected = np.sum(predictions[mask] == 1)
+        total = np.sum(mask)
+        detection_rate = float(detected / total) if total > 0 else 0.0
+        
+        results[attack_cat] = {
+            'detection_rate': detection_rate,
+            'detected': int(detected),
+            'total': int(total)
+        }
+    
+    # 正常样本的误报率
+    normal_mask = (labels == 0)
+    if np.sum(normal_mask) > 0:
+        false_alarms = np.sum(predictions[normal_mask] == 1)
+        results['normal'] = {
+            'false_alarm_rate': float(false_alarms / np.sum(normal_mask)),
+            'false_alarms': int(false_alarms),
+            'total': int(np.sum(normal_mask))
+        }
+    
+    return results
 
 
 def logits_statistics(logits: torch.Tensor) -> Dict[str, float]:
