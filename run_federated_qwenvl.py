@@ -20,7 +20,7 @@ import json
 import torch
 import numpy as np
 from datetime import datetime
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, Dataset
 
 # 导入联邦学习模块
 from federation.client import FederatedClient
@@ -49,6 +49,98 @@ try:
 except ImportError:
     print("警告: 攻击数据集模块未找到，将使用原始数据集")
     ATTACK_DATASET_AVAILABLE = False
+
+try:
+    from attacks.attack_generator import attack_type_to_label
+except ImportError:
+    def attack_type_to_label(attack_type):
+        mapping = {
+            'normal': 0, 'adversarial_patch': 1, 'sensor_spoofing': 2,
+            'physical_attack': 3, 'data_poisoning': 4
+        }
+        return mapping.get(attack_type, 0)
+
+
+class ClientLocalAttackDataset(Dataset):
+    """
+    客户端本地攻击数据集包装器
+    为每个客户端分配独立的数据索引，并在本地生成随机攻击。
+    """
+    def __init__(self, base_dataset, indices, attack_ratio, config):
+        self.base_dataset = base_dataset
+        self.indices = indices
+        self.attack_ratio = attack_ratio
+        self.config = config
+        
+        # 记录样本总数
+        self.num_samples = len(indices)
+        
+        # 预计算本地攻击分配 (保证每个epoch的一致性)
+        # 使用第一个索引作为种子，使每个客户端的随机性不同但可复现
+        seed = indices[0] if (indices is not None and len(indices) > 0) else 42
+        rng = np.random.RandomState(seed)
+        
+        self.local_is_attack = rng.rand(self.num_samples) < self.attack_ratio
+        
+        # 预先分配攻击类型
+        self.attack_types_list = ['adversarial_patch', 'sensor_spoofing', 'physical_attack', 'data_poisoning']
+        self.local_attack_types = []
+        for i in range(self.num_samples):
+            if self.local_is_attack[i]:
+                self.local_attack_types.append(rng.choice(self.attack_types_list))
+            else:
+                self.local_attack_types.append('normal')
+        
+    def __len__(self):
+        return self.num_samples
+        
+    def __getitem__(self, idx):
+        # 获取基础数据（此时基础数据集应该是干净的）
+        real_idx = self.indices[idx]
+        data = self.base_dataset[real_idx]
+        
+        # 应用本地攻击逻辑
+        is_attack = self.local_is_attack[idx]
+        attack_type = self.local_attack_types[idx]
+        
+        if is_attack:
+            # 1. 如果基础数据集有攻击生成器，应用真实攻击
+            if hasattr(self.base_dataset, 'attack_generator'):
+                image = data['images']
+                # 处理点云 (可能是 Tensor 或 numpy)
+                if torch.is_tensor(data['pointclouds']):
+                    # 如果是 CUDA Tensor 需要转到 CPU
+                    points = data['pointclouds'].detach().cpu().numpy()
+                else:
+                    points = data['pointclouds']
+                
+                # 应用攻击生成器
+                attacked_image, attacked_points, attack_info = self.base_dataset.attack_generator.apply_attack(
+                    image, points, attack_type
+                )
+                
+                # 更新返回数据内容
+                data['images'] = attacked_image
+                data['pointclouds'] = torch.from_numpy(attacked_points).float()
+                data['attack_info'] = attack_info
+            
+            # 2. 更新标签和类型 (始终更新，即使是 mini 版本也会生效)
+            label = attack_type_to_label(attack_type)
+            data['labels'] = torch.tensor(label, dtype=torch.long)
+            data['attack_types'] = attack_type
+        else:
+            # 确保是正常标签
+            data['labels'] = torch.tensor(0, dtype=torch.long)
+            data['attack_types'] = 'normal'
+            
+        return data
+
+    def get_statistics(self):
+        """获取本地统计信息"""
+        stats = {}
+        for t in self.local_attack_types:
+            stats[t] = stats.get(t, 0) + 1
+        return stats
 
 
 def create_model(config: FederatedConfig):
@@ -109,12 +201,35 @@ def setup_clients(
     num_samples = len(train_dataset)
     client_indices = partition_data_iid(num_samples, config.num_clients)
     
+    # 确定哪些客户端是干净的
+    # 随机选择 num_clean_clients 个客户端
+    clean_client_ids = np.random.choice(config.num_clients, config.num_clean_clients, replace=False)
+    
     clients = []
     for i in range(config.num_clients):
         logger.log(f"\n初始化客户端 {i}...")
         
-        # 创建客户端专属数据加载器
-        client_dataset = Subset(train_dataset, client_indices[i])
+        # 确定该客户端的攻击比例
+        if i in clean_client_ids:
+            local_attack_ratio = 0.0
+            logger.log(f"  - 客户端 {i} 被设定为干净客户端 (attack_ratio = 0.0)")
+        else:
+            # 随机生成攻击比例 (0.1 到 0.6 之间随机)
+            local_attack_ratio = np.random.uniform(0.1, 0.6)
+            logger.log(f"  - 客户端 {i} 随机生成的攻击比例: {local_attack_ratio:.1%}")
+            
+        # 创建客户端专属数据集
+        client_dataset = ClientLocalAttackDataset(
+            base_dataset=train_dataset,
+            indices=client_indices[i],
+            attack_ratio=local_attack_ratio,
+            config=config
+        )
+        
+        # 记录本地统计信息
+        local_stats = client_dataset.get_statistics()
+        logger.log(f"  - 数据量: {len(client_indices[i])} 样本, 攻击分布: {local_stats}")
+        
         client_loader = DataLoader(
             client_dataset,
             batch_size=config.batch_size,
@@ -525,15 +640,15 @@ def run_federated_training(config: FederatedConfig):
     comm_manager = CommunicationManager()
     
     # 加载数据集
-    logger.log("\n加载数据集...")
+    logger.log("\n加载数据集 (统一初始化为干净数据)...")
     
     # 选择数据集类型
     if config.use_attack_dataset and ATTACK_DATASET_AVAILABLE:
-        logger.log("使用增强攻击数据集（真实攻击生成）")
+        logger.log("使用增强攻击数据集 (真实攻击生成器)")
         
-        # 攻击配置
+        # 初始全局数据集设为0，由各客户端本地按规则应用随机攻击
         attack_config = {
-            'attack_ratio': config.attack_ratio,
+            'attack_ratio': 0.0,
             'attack_weights': {
                 'adversarial_patch': 0.25,
                 'sensor_spoofing': 0.25,
@@ -546,7 +661,7 @@ def run_federated_training(config: FederatedConfig):
             dataroot=config.dataroot,
             version=config.version,
             split='train',
-            attack_ratio=config.attack_ratio,
+            attack_ratio=0.0,
             num_points=config.num_points,
             use_synthetic=config.use_synthetic_data,
             num_synthetic_samples=config.num_synthetic_samples,
@@ -554,12 +669,12 @@ def run_federated_training(config: FederatedConfig):
         )
         collate_fn = attack_collate_fn
     else:
-        logger.log("使用原始数据集（简单攻击标记）")
+        logger.log("使用原始数据集（简单攻击标记 - 初始设置为干净）")
         train_dataset = NuScenesMiniDataset(
             dataroot=config.dataroot,
             version=config.version,
             split='train',
-            attack_ratio=config.attack_ratio,
+            attack_ratio=0.0,
             num_points=config.num_points,
             use_cache=True
         )
@@ -678,7 +793,7 @@ def parse_args():
                         default=r'/root/autodl-tmp/zrj/data/nusences',
                         help='nuScenes数据集路径')
     parser.add_argument('--batch_size', type=int, default=1, help='批次大小')
-    parser.add_argument('--attack_ratio', type=float, default=0.5, help='攻击样本比例')
+    parser.add_argument('--num_clean_clients', type=int, default=0, help='干净客户端的数量(attack_ratio为0)')
     
     # 攻击数据集参数
     parser.add_argument('--use_attack_dataset', action='store_true', default=True,
@@ -736,7 +851,7 @@ def main():
             server_lr=args.server_lr,
             dataroot=args.dataroot,
             batch_size=args.batch_size,
-            attack_ratio=args.attack_ratio,
+            num_clean_clients=args.num_clean_clients,
             use_attack_dataset=use_attack_dataset,
             use_synthetic_data=args.use_synthetic_data,
             num_synthetic_samples=args.num_synthetic_samples,

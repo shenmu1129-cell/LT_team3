@@ -54,7 +54,8 @@ class FederatedConfig:
     max_batches: int = 0  # 每轮每客户端最大训练batch数，0表示跑完整个epoch
     server_max_batches: int = 0  # 服务器公共数据集最大batch数，0表示跑完整个数据集
     num_workers: int = 2
-    attack_ratio: float = 0.3
+    attack_ratio: float = 0.3  # 全局基础比例（如果启用随机则作为参考）
+    num_clean_clients: int = 0 # 干净客户端数量 (attack_ratio 固定为 0)
     malicious_client_ratio: float = 0.0  # 恶意客户端比例 (0.0-1.0)
     num_points: int = 2048
     

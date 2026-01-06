@@ -1,0 +1,52 @@
+`torch_dtype` is deprecated! Use `dtype` instead!
+使用设备: cuda
+初始化NuScenes攻击数据集: train
+攻击比例: 0.0%
+找到 28130 个样本
+
+============================================================
+数据集统计 (train)
+============================================================
+  总样本数: 28130
+  攻击比例: 0.0%
+
+  攻击类型分布:
+    - normal: 28130 (100.0%)
+============================================================
+
+[模型信息] Qwen隐藏层维度: 2048, 点云特征维度: 1024
+[模型信息] 分类器输入维度: 3072
+trainable params: 3,211,264 || all params: 2,130,743,296 || trainable%: 0.1507
+[模型信息] Qwen隐藏层维度: 2048, 点云特征维度: 1024
+[模型信息] 分类器输入维度: 3072
+trainable params: 3,211,264 || all params: 2,130,743,296 || trainable%: 0.1507
+[模型信息] Qwen隐藏层维度: 2048, 点云特征维度: 1024
+[模型信息] 分类器输入维度: 3072
+trainable params: 3,211,264 || all params: 2,130,743,296 || trainable%: 0.1507
+Traceback (most recent call last):
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 873, in <module>
+    main()
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 869, in main
+    run_federated_training(config)
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 704, in run_federated_training
+    round_metrics = run_federated_round(
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 367, in run_federated_round
+    batch = next(iter(client.data_loader))
+  File "/home/sutongtong/anaconda3/envs/wwt310/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 732, in __next__
+    data = self._next_data()
+  File "/home/sutongtong/anaconda3/envs/wwt310/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1506, in _next_data
+    return self._process_data(data, worker_id)
+  File "/home/sutongtong/anaconda3/envs/wwt310/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1541, in _process_data
+    data.reraise()
+  File "/home/sutongtong/anaconda3/envs/wwt310/lib/python3.10/site-packages/torch/_utils.py", line 769, in reraise
+    raise exception
+RuntimeError: Caught RuntimeError in DataLoader worker process 0.
+Original Traceback (most recent call last):
+  File "/home/sutongtong/anaconda3/envs/wwt310/lib/python3.10/site-packages/torch/utils/data/_utils/worker.py", line 349, in _worker_loop
+    data = fetcher.fetch(index)  # type: ignore[possibly-undefined]
+  File "/home/sutongtong/anaconda3/envs/wwt310/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py", line 55, in fetch
+    return self.collate_fn(data)
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/test_local_train_mini_qwen3vl_fixed.py", line 825, in custom_collate_fn
+    pointclouds = torch.stack([item['pointclouds'] for item in batch])
+RuntimeError: stack expects each tensor to be equal size, but got [2048, 3] at entry 0 and [1930, 3] at entry 7
+
