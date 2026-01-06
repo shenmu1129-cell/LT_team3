@@ -87,18 +87,33 @@ class FederatedServer:
         free_energies: List[float]
     ) -> np.ndarray:
         """
-        基于自由能计算客户端权重
+        根据选定的聚合策略计算客户端权重
         
         Args:
             free_energies: 各客户端的自由能列表
             
         Returns:
-            weights: 归一化的权重数组，和为1
+            weights: 归一化的权重数组
         """
-        weights = compute_client_weights(
-            free_energies,
-            tau=self.config.tau
-        )
+        method = self.config.aggregation_method
+        num_clients = len(free_energies)
+        
+        if method == "active_inference":
+            # 基于自由能的主动推理权重
+            weights = compute_client_weights(
+                free_energies,
+                tau=self.config.tau
+            )
+        elif method in ["fedavg", "fedprox"]:
+            # FedAvg和FedProx在聚合阶段通常使用简单平均(或按样本量加权)
+            # 在没有实时获取样本量的情况下，使用 uniform 权重
+            weights = np.ones(num_clients) / num_clients
+        else:
+            print(f"Warning: 未知的聚合方式 {method}, 退回到主动推理")
+            weights = compute_client_weights(
+                free_energies,
+                tau=self.config.tau
+            )
         
         self.weight_history.append(weights.copy())
         return weights

@@ -40,6 +40,10 @@ class FederatedConfig:
     gamma_entropy: float = 0.1   # CE方案的熵权重γ
     tau: float = 1.0  # 权重计算温度τ
     
+    # ========== 聚合策略参数 ==========
+    aggregation_method: str = "active_inference"  # "active_inference", "fedavg", "fedprox"
+    fedprox_mu: float = 0.01  # FedProx正则化项权重μ
+    
     # ========== Logits提取参数 ==========
     logits_mode: str = "cls"  # "cls", "last_token", "mean_pool"
     
@@ -99,6 +103,10 @@ class FederatedConfig:
         
         assert self.logits_mode in ["cls", "last_token", "mean_pool"], \
             "logits_mode必须是'cls', 'last_token'或'mean_pool'"
+        
+        assert self.aggregation_method in ["active_inference", "fedavg", "fedprox"], \
+            "aggregation_method必须是'active_inference', 'fedavg'或'fedprox'"
+        assert self.fedprox_mu >= 0, "fedprox_mu必须非负"
         
         assert self.batch_size > 0, "batch_size必须大于0"
         assert self.lr > 0, "lr必须大于0"

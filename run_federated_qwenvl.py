@@ -769,6 +769,12 @@ def parse_args():
     parser.add_argument('--lambda_entropy', type=float, default=0.1, help='KL方案熵权重')
     parser.add_argument('--gamma_entropy', type=float, default=0.1, help='CE方案熵权重')
     
+    # 聚合策略参数
+    parser.add_argument('--aggregation_method', type=str, default='active_inference',
+                        choices=['active_inference', 'fedavg', 'fedprox'], 
+                        help='聚合方式选择: 主动推理(默认), FedAvg, FedProx')
+    parser.add_argument('--fedprox_mu', type=float, default=0.01, help='FedProx正则化项权重mu')
+    
     # 蒸馏参数
     parser.add_argument('--alpha', type=float, default=0.5, help='交叉熵权重')
     parser.add_argument('--beta', type=float, default=0.5, help='KL散度权重')
@@ -840,6 +846,8 @@ def main():
             tau=args.tau,
             lambda_entropy=args.lambda_entropy,
             gamma_entropy=args.gamma_entropy,
+            aggregation_method=args.aggregation_method,
+            fedprox_mu=args.fedprox_mu,
             alpha=args.alpha,
             beta=args.beta,
             temperature=args.temperature,

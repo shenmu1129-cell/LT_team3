@@ -1,0 +1,71 @@
+WARNING:root:Some parameters are on the meta device device because they were offloaded to the cpu.
+================================================================================
+联邦学习训练 - 基于主动推理的Qwen3-VL攻击检测系统
+================================================================================
+
+配置信息:
+FederatedConfig:
+  num_clients: 5
+  num_rounds: 100
+  local_epochs: 1
+  model_path: /home/sutongtong/wwt/model/Qwen3-VL-2B-Instruct
+  pointcloud_dim: 1024
+  qwen_hidden_dim: 2048
+  alpha: 0.5
+  beta: 0.5
+  temperature: 0.4
+  free_energy_mode: kl_entropy
+  lambda_entropy: 0.1
+  gamma_entropy: 0.1
+  tau: 1.0
+  logits_mode: cls
+  enable_server_update: True
+  server_lr: 1e-05
+  dataroot: /home/sutongtong/LanTu_team3/dataset/nuScenes/train
+  version: v1.0-trainval
+  batch_size: 32
+  max_batches: 20
+  server_max_batches: 2
+  num_workers: 2
+  attack_ratio: 0.3
+  malicious_client_ratio: 0.4
+  num_points: 2048
+  lr: 0.0001
+  weight_decay: 0.01
+  device: cuda
+  log_dir: ./logs_federated
+  save_dir: ./checkpoints_federated
+  verbose: True
+  mode: single_process
+[2026-01-06 15:59:29] [INFO] 联邦学习训练开始
+[2026-01-06 15:59:29] [INFO] 配置: {'num_clients': 5, 'num_rounds': 100, 'local_epochs': 1, 'model_path': '/home/sutongtong/wwt/model/Qwen3-VL-2B-Instruct', 'pointcloud_dim': 1024, 'qwen_hidden_dim': 2048, 'alpha': 0.5, 'beta': 0.5, 'temperature': 0.4, 'free_energy_mode': 'kl_entropy', 'lambda_entropy': 0.1, 'gamma_entropy': 0.1, 'tau': 1.0, 'logits_mode': 'cls', 'enable_server_update': True, 'server_lr': 1e-05, 'dataroot': '/home/sutongtong/LanTu_team3/dataset/nuScenes/train', 'version': 'v1.0-trainval', 'batch_size': 32, 'max_batches': 20, 'server_max_batches': 2, 'num_workers': 2, 'attack_ratio': 0.3, 'malicious_client_ratio': 0.4, 'num_points': 2048, 'lr': 0.0001, 'weight_decay': 0.01, 'device': 'cuda', 'log_dir': './logs_federated', 'save_dir': './checkpoints_federated', 'verbose': True, 'mode': 'single_process'}
+
+初始化联邦服务器...
+trainable params: 3,211,264 || all params: 2,441,908,224 || trainable%: 0.1315
+加载服务器公共数据集 (val split)...
+初始化NuScenes数据集: val
+找到 6019 个样本
+✓ 公共数据集加载成功: 6019 样本
+Traceback (most recent call last):
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 655, in <module>
+    main()
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 574, in main
+    server = init_server(config)
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 246, in init_server
+    server = FederatedServer(
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/federation/server.py", line 38, in __init__
+    self.model = model.to(device)
+  File "/home/sutongtong/anaconda3/envs/wwt310/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1371, in to
+    return self._apply(convert)
+  File "/home/sutongtong/anaconda3/envs/wwt310/lib/python3.10/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/home/sutongtong/anaconda3/envs/wwt310/lib/python3.10/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/home/sutongtong/anaconda3/envs/wwt310/lib/python3.10/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  [Previous line repeated 5 more times]
+  File "/home/sutongtong/anaconda3/envs/wwt310/lib/python3.10/site-packages/torch/nn/modules/module.py", line 957, in _apply
+    param_applied = fn(param)
+  File "/home/sutongtong/anaconda3/envs/wwt310/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1364, in convert
+    raise NotImplementedError(
+NotImplementedError: Cannot copy out of meta tensor; no data! Please use torch.nn.Module.to_empty() instead of torch.nn.Module.to() when moving module from meta to a different device.

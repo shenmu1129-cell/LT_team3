@@ -159,6 +159,23 @@ class FederatedClient:
         
         return total_loss
     
+    def compute_proximal_loss(self, global_params: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        计算FedProx的近端项 (Proximal Term)
+        Loss_prox = (mu / 2) * Σ || θ - θ_global ||^2
+        
+        Args:
+            global_params: 全局模型参数字典
+            
+        Returns:
+            torch.Tensor: 近端损失
+        """
+        prox_loss = 0.0
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in global_params:
+                prox_loss += torch.norm(param - global_params[name].to(self.device))**2
+        return (self.config.fedprox_mu / 2) * prox_loss
+    
     def local_update_with_distillation(
         self,
         global_logits: torch.Tensor,
@@ -180,6 +197,11 @@ class FederatedClient:
             num_epochs = self.config.local_epochs
         
         self.model.train()
+        
+        # 如果是FedProx，保存当前模型权重作为参考(global_params)
+        global_params = None
+        if self.config.aggregation_method == "fedprox":
+            global_params = {n: p.detach().clone() for n, p in self.model.named_parameters() if p.requires_grad}
         
         total_loss = 0.0
         all_predictions = []
@@ -225,6 +247,11 @@ class FederatedClient:
                     global_logits_batch,
                     labels
                 )
+                
+                # 如果是FedProx，增加近端项
+                if global_params is not None:
+                    prox_loss = self.compute_proximal_loss(global_params)
+                    loss += prox_loss
                 
                 # 反向传播
                 loss.backward()
@@ -521,6 +548,11 @@ class FederatedClient:
         
         self.model.train()
         
+        # 如果是FedProx，保存当前模型权重作为参考(global_params)
+        global_params = None
+        if self.config.aggregation_method == "fedprox":
+            global_params = {n: p.detach().clone() for n, p in self.model.named_parameters() if p.requires_grad}
+        
         total_distill_loss = 0.0
         total_detect_loss = 0.0
         total_defend_loss = 0.0
@@ -589,6 +621,11 @@ class FederatedClient:
                                  gamma * defend_loss)
                 else:
                     total_loss = distill_loss
+                
+                # 如果是FedProx，增加近端项
+                if global_params is not None:
+                    prox_loss = self.compute_proximal_loss(global_params)
+                    total_loss += prox_loss
                 
                 # 反向传播
                 total_loss.backward()
