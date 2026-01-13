@@ -28,7 +28,12 @@ from federation.server import FederatedServer
 from federation.config import FederatedConfig
 from federation.comm import CommunicationManager
 from federation.logger import FederatedLogger
-from federation.utils import partition_data_iid, partition_data_non_iid, aggregate_metrics
+from federation.utils import (
+    partition_data_iid, 
+    partition_data_non_iid, 
+    partition_data_dirichlet,
+    aggregate_metrics
+)
 
 # 导入模型和数据集
 from test_local_train_mini_qwen3vl_fixed import (
@@ -211,7 +216,40 @@ def setup_clients(
     
     # 数据分区
     num_samples = len(train_dataset)
-    client_indices = partition_data_iid(num_samples, config.num_clients)
+    
+    if config.partition_mode == "iid":
+        client_indices = partition_data_iid(num_samples, config.num_clients)
+    elif config.partition_mode == "non-iid-dirichlet":
+        # 尝试从数据集获取标签以进行 Dirichlet 分区
+        labels = None
+        if hasattr(train_dataset, 'attack_labels'):
+            labels = train_dataset.attack_labels
+        elif hasattr(train_dataset, 'labels'):
+            labels = train_dataset.labels
+            
+        if labels is not None and len(np.unique(labels)) > 1:
+            logger.log(f"使用基于标签的 Dirichlet 分区 (alpha={config.dirichlet_alpha})")
+            client_indices = partition_data_dirichlet(num_samples, config.num_clients, config.dirichlet_alpha, labels)
+        else:
+            logger.log(f"未找到有效标签或标签单一，使用基于数据量的 Dirichlet 分区 (alpha={config.dirichlet_alpha})")
+            client_indices = partition_data_dirichlet(num_samples, config.num_clients, config.dirichlet_alpha)
+    elif config.partition_mode == "non-iid-shard":
+        # 尝试从数据集获取标签以进行 Shard 分区
+        labels = None
+        if hasattr(train_dataset, 'attack_labels'):
+            labels = train_dataset.attack_labels
+        elif hasattr(train_dataset, 'labels'):
+            labels = train_dataset.labels
+            
+        if labels is not None:
+            logger.log(f"使用基于分片(Shard)的 Non-IID 分区")
+            client_indices = partition_data_non_iid(num_samples, labels, config.num_clients)
+        else:
+            logger.log("警告: 未找到标签，无法进行 Shard 分区，回退到 IID 分区")
+            client_indices = partition_data_iid(num_samples, config.num_clients)
+    else:
+        logger.log(f"未知分区模式 {config.partition_mode}，回退到 IID 分区")
+        client_indices = partition_data_iid(num_samples, config.num_clients)
     
     # 确定哪些客户端是干净的
     # 随机选择 num_clean_clients 个客户端
@@ -810,8 +848,13 @@ def parse_args():
     parser.add_argument('--dataroot', type=str, 
                         default=r'/root/autodl-tmp/zrj/data/nusences',
                         help='nuScenes数据集路径')
+    parser.add_argument('--version', type=str, default='v1.0-trainval', help='数据集版本 (v1.0-trainval, v1.0-mini)')
     parser.add_argument('--batch_size', type=int, default=1, help='批次大小')
     parser.add_argument('--num_clean_clients', type=int, default=0, help='干净客户端的数量(attack_ratio为0)')
+    parser.add_argument('--partition_mode', type=str, default='iid', choices=['iid', 'non-iid-dirichlet', 'non-iid-shard'],
+                        help='数据分区模式: iid, non-iid-dirichlet, non-iid-shard')
+    parser.add_argument('--dirichlet_alpha', type=float, default=0.5,
+                        help='狄利克雷分布参数 (用于 non-iid-dirichlet 模式)')
     
     # 攻击数据集参数
     parser.add_argument('--use_attack_dataset', action='store_true', default=True,
@@ -870,8 +913,11 @@ def main():
             enable_server_update=args.enable_server_update,
             server_lr=args.server_lr,
             dataroot=args.dataroot,
+            version=args.version,
             batch_size=args.batch_size,
             num_clean_clients=args.num_clean_clients,
+            partition_mode=args.partition_mode,
+            dirichlet_alpha=args.dirichlet_alpha,
             use_attack_dataset=use_attack_dataset,
             use_synthetic_data=args.use_synthetic_data,
             num_synthetic_samples=args.num_synthetic_samples,

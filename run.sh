@@ -1,8 +1,10 @@
-CUDA_VISIBLE_DEVICES=5 nohup python run_federated_qwenvl.py \
+CUDA_VISIBLE_DEVICES=3 nohup python run_federated_qwenvl.py \
     --num_clients 2 \
     --num_rounds 100 \
     --batch_size 2 \
     --temperature 0.4 \
+    --partition_mode non-iid-dirichlet \
+    --dirichlet_alpha 0.1 \
     --dataroot "/home/sutongtong/LanTu_team3/dataset/nuScenes/train" \
     --enable_server_update \
     --num_clean_clients 1 \

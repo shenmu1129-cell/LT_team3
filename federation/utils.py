@@ -362,6 +362,11 @@ def partition_data_non_iid(
     Returns:
         List[List[int]]: 每个客户端的样本索引列表
     """
+    # 限制分片数量不超过数据集大小
+    num_shards = min(num_shards, dataset_size)
+    if num_shards == 0:
+        return [list(range(dataset_size)) for _ in range(num_clients)]
+        
     # 按标签排序
     sorted_indices = np.argsort(labels).tolist()
     
@@ -394,6 +399,64 @@ def partition_data_non_iid(
         
         client_indices.append(client_data)
     
+    return client_indices
+
+
+def partition_data_dirichlet(
+    dataset_size: int,
+    num_clients: int,
+    alpha: float,
+    labels: Optional[np.ndarray] = None
+) -> List[List[int]]:
+    """
+    基于狄利克雷分布的数据分区 (Non-IID)
+    
+    Args:
+        dataset_size: 数据集大小
+        num_clients: 客户端数量
+        alpha: 狄利克雷分布参数，值越小数据越异构
+        labels: 类别标签。如果提供，则进行标签分布偏斜分区；
+                如果为None，则仅进行数据量偏斜分区。
+                
+    Returns:
+        List[List[int]]: 每个客户端的样本索引列表
+    """
+    np.random.seed(42)
+    
+    if labels is not None and len(labels) == dataset_size:
+        # 标签分布偏斜 (Label Distribution Skew)
+        num_classes = len(np.unique(labels))
+        client_indices = [[] for _ in range(num_clients)]
+        
+        for k in range(num_classes):
+            idx_k = np.where(labels == k)[0]
+            np.random.shuffle(idx_k)
+            
+            # 为每个类别k生成客户端分布
+            proportions = np.random.dirichlet([alpha] * num_clients)
+            
+            # 计算每个客户端应分配的样本数
+            proportions = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
+            
+            # 分割索引
+            split_idx = np.split(idx_k, proportions)
+            for i in range(num_clients):
+                client_indices[i].extend(split_idx[i].tolist())
+                
+        # 再次对各客户端内部索引进行打乱
+        for i in range(num_clients):
+            np.random.shuffle(client_indices[i])
+            
+    else:
+        # 数据量偏斜 (Quantity Skew)
+        # 为每个客户端生成样本量大小分布
+        proportions = np.random.dirichlet([alpha] * num_clients)
+        proportions = (np.cumsum(proportions) * dataset_size).astype(int)[:-1]
+        
+        indices = np.random.permutation(dataset_size)
+        split_idx = np.split(indices, proportions)
+        client_indices = [idx.tolist() for idx in split_idx]
+        
     return client_indices
 
 

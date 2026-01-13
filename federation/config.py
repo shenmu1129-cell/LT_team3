@@ -55,6 +55,8 @@ class FederatedConfig:
     dataroot: str = "/home/sutongtong/LanTu_team3/dataset/nuScenes/train"
     version: str = "v1.0-trainval"
     batch_size: int = 3
+    partition_mode: str = "iid"  # "iid", "non-iid-dirichlet", "non-iid-shard"
+    dirichlet_alpha: float = 0.5 # 狄利克雷分布参数α，越小异构程度越高
     max_batches: int = 0  # 每轮每客户端最大训练batch数，0表示跑完整个epoch
     server_max_batches: int = 0  # 服务器公共数据集最大batch数，0表示跑完整个数据集
     num_workers: int = 2
@@ -107,6 +109,10 @@ class FederatedConfig:
         assert self.aggregation_method in ["active_inference", "fedavg", "fedprox"], \
             "aggregation_method必须是'active_inference', 'fedavg'或'fedprox'"
         assert self.fedprox_mu >= 0, "fedprox_mu必须非负"
+        
+        assert self.partition_mode in ["iid", "non-iid-dirichlet", "non-iid-shard"], \
+            "partition_mode必须是'iid', 'non-iid-dirichlet'或'non-iid-shard'"
+        assert self.dirichlet_alpha > 0, "dirichlet_alpha必须大于0"
         
         assert self.batch_size > 0, "batch_size必须大于0"
         assert self.lr > 0, "lr必须大于0"
