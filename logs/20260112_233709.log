@@ -1,0 +1,45 @@
+2026-01-12 23:37:15.146746: I tensorflow/core/util/port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-01-12 23:37:15.207602: I tensorflow/core/platform/cpu_feature_guard.cc:210] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: AVX2 AVX512F AVX512_VNNI FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2026-01-12 23:37:16.628372: I tensorflow/core/util/port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+`torch_dtype` is deprecated! Use `dtype` instead!
+使用设备: cuda
+初始化NuScenes攻击数据集: train
+攻击比例: 0.0%
+找到 28130 个样本
+
+============================================================
+数据集统计 (train)
+============================================================
+  总样本数: 28130
+  攻击比例: 0.0%
+
+  攻击类型分布:
+    - normal: 28130 (100.0%)
+============================================================
+
+[模型信息] Qwen隐藏层维度: 2048, 点云特征维度: 1024
+[模型信息] 分类器输入维度: 3072
+Traceback (most recent call last):
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 893, in <module>
+    main()
+    ~~~~^^
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 889, in main
+    run_federated_training(config)
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 698, in run_federated_training
+    clients = setup_clients(config, train_dataset, device, logger)
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 257, in setup_clients
+    client_model = create_model(config)
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/run_federated_qwenvl.py", line 181, in create_model
+    model = Qwen3VLDefenseSystem(
+        pointcloud_dim=config.pointcloud_dim,
+        qwen_hidden_dim=None,  # 自动检测
+        model_name=config.model_path
+    )
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/test_local_train_mini_qwen3vl_fixed.py", line 80, in __init__
+    self._setup_lora()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/sutongtong/wwt/code/fedmkt-based_bak/test_local_train_mini_qwen3vl_fixed.py", line 103, in _setup_lora
+    from peft import LoraConfig, get_peft_model
+ModuleNotFoundError: No module named 'peft'

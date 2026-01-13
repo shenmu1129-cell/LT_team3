@@ -43,9 +43,10 @@ class FederatedServer:
         # 如果启用服务器更新，初始化优化器
         if config.enable_server_update:
             trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-            self.optimizer = torch.optim.AdamW(
+            self.optimizer = torch.optim.SGD(
                 trainable_params,
                 lr=config.server_lr,
+                momentum=0.9,
                 weight_decay=config.weight_decay
             )
         else:

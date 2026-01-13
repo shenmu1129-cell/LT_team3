@@ -1,0 +1,71 @@
+commit 47329452919982411c8e60fc597056e2ae8a941b
+Author: wwt <550827310@qq.com>
+Date:   Wed Jan 7 11:35:29 2026 +0800
+
+    [1.10]修改优化器，从adam改为SGD
+
+commit e46dba664ee5c89419f05775f258c3532f943c50
+Author: wwt <550827310@qq.com>
+Date:   Tue Jan 6 16:27:42 2026 +0800
+
+    [1.9]增加fedavg和fedprox聚合方式，可在命令行中输入--aggregation_method进行控制
+
+commit 2164333d41b797231598e5bdf33e96ca221aa39e
+Author: wwt <550827310@qq.com>
+Date:   Tue Jan 6 15:53:37 2026 +0800
+
+    [1.8]修改攻击比例
+
+commit 03c72ccf40ed470552be54a1edca06d251260435
+Author: wwt <550827310@qq.com>
+Date:   Sun Dec 28 19:16:25 2025 +0800
+
+    [1.7]整合嘉哥代码，增加4类攻击种类
+
+commit d3702ad9d9e9b8cb92c38b9db2d11e8087cb6e18
+Author: wwt <550827310@qq.com>
+Date:   Fri Dec 26 16:49:51 2025 +0800
+
+    [1.6]增加对异常客户端的控制
+
+commit 1bcdcbf03e96208588ff1532510f3725f87ee4e5
+Author: wwt <550827310@qq.com>
+Date:   Wed Dec 24 21:54:01 2025 +0800
+
+    [1.5]1.修改训练参数 2.更改公共数据集逻辑
+
+commit 3113580c41d31ea350aca2595d66de95c67c9226
+Author: wwt <550827310@qq.com>
+Date:   Sat Dec 20 17:51:30 2025 +0800
+
+    [1.4]1.增加服务端公共数据集 2.增加服务端使用公共训练集的批次参数【server_max_batches】
+
+commit a8071bb6a33faf21adbeb86fd2554b03990f74d3
+Author: wwt <550827310@qq.com>
+Date:   Sat Dec 20 15:09:53 2025 +0800
+
+    [1.3]修复【自由能和权重】不变的问题
+
+commit 408936fe39a37d71a3e868fa8fe7679a35cf6c10
+Author: wwt <550827310@qq.com>
+Date:   Fri Dec 19 20:47:26 2025 +0800
+
+    [1.2]1.修改只使用qwen3的视觉塔，而不使用它的LLM进行推理,为了提高训练速度 2.修改输入图片的分辨率
+
+commit 2c63dff1bc379f702064d8afd13f049ee2a6bea1
+Author: wwt <550827310@qq.com>
+Date:   Fri Dec 19 15:07:12 2025 +0800
+
+    [1.1]1.修复run文件.  2.使用批处理来优化速度，提高10%.  3.忽略alert
+
+commit 3a6bde3c58dc191bd2a1bc1d0bcf134795e08309
+Author: wwt <550827310@qq.com>
+Date:   Fri Dec 19 13:48:04 2025 +0800
+
+    [1.0]提交run文件
+
+commit 46180485b449eb8c2ad2dccd627f43c796f7a886
+Author: wwt <550827310@qq.com>
+Date:   Wed Dec 17 20:54:52 2025 +0800
+
+    Initial commit: federated learning Qwen3VL project

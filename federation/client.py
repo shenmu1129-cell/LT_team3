@@ -44,9 +44,10 @@ class FederatedClient:
         
         # 初始化优化器
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.AdamW(
+        self.optimizer = torch.optim.SGD(
             trainable_params,
             lr=config.lr,
+            momentum=0.9,
             weight_decay=config.weight_decay
         )
         

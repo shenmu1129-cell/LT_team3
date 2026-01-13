@@ -119,6 +119,18 @@ class ClientLocalAttackDataset(Dataset):
                     image, points, attack_type
                 )
                 
+                # 确保点云维度对齐 (攻击可能增加了或减少了点数)
+                num_points = self.config.num_points
+                if attacked_points.shape[0] > num_points:
+                    # 如果点多了，进行随机采样
+                    sampled_indices = np.random.choice(attacked_points.shape[0], num_points, replace=False)
+                    attacked_points = attacked_points[sampled_indices]
+                elif attacked_points.shape[0] < num_points:
+                    # 如果点少了，补齐到指定点数
+                    pad_size = num_points - attacked_points.shape[0]
+                    padding = np.zeros((pad_size, 3))
+                    attacked_points = np.vstack([attacked_points, padding])
+                
                 # 更新返回数据内容
                 data['images'] = attacked_image
                 data['pointclouds'] = torch.from_numpy(attacked_points).float()

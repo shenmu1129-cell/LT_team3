@@ -769,9 +769,10 @@ class EnhancedTrainer:
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         print(f"\n可训练参数数量: {sum(p.numel() for p in trainable_params):,}")
         
-        self.optimizer = torch.optim.AdamW(
+        self.optimizer = torch.optim.SGD(
             trainable_params,
             lr=lr,
+            momentum=0.9,
             weight_decay=weight_decay
         )
         
