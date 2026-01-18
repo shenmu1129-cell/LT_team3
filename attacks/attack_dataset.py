@@ -88,11 +88,13 @@ class NuScenesAttackDataset(Dataset):
         
         # 收集样本
         self.samples = []
+        self.scene_tokens = []
         for scene in self.nusc.scene:
             if scene['name'] in scene_names:
                 sample_token = scene['first_sample_token']
                 while sample_token:
                     self.samples.append(sample_token)
+                    self.scene_tokens.append(scene['token'])
                     sample = self.nusc.get('sample', sample_token)
                     sample_token = sample['next']
         

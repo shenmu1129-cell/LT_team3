@@ -222,16 +222,28 @@ def setup_clients(
     elif config.partition_mode == "non-iid-dirichlet":
         # 尝试从数据集获取标签以进行 Dirichlet 分区
         labels = None
-        if hasattr(train_dataset, 'attack_labels'):
-            labels = train_dataset.attack_labels
-        elif hasattr(train_dataset, 'labels'):
-            labels = train_dataset.labels
+        
+        # 优先方案：基于 nuScenes 场景 (Scene) 进行划分，解决多标签不兼容问题
+        if hasattr(train_dataset, 'scene_tokens'):
+            scene_tokens = train_dataset.scene_tokens
+            # 将 scene_token (字符串) 映射为整数 ID
+            unique_scenes = sorted(list(set(scene_tokens)))
+            scene_to_id = {token: i for i, token in enumerate(unique_scenes)}
+            labels = np.array([scene_to_id[token] for token in scene_tokens])
+            logger.log(f"[方案1] 检测到场景标记 ({len(unique_scenes)}个场景)，将基于地理场景进行 Non-IID 划分")
+        
+        # 次选方案：基于已有标签
+        if labels is None:
+            if hasattr(train_dataset, 'attack_labels'):
+                labels = train_dataset.attack_labels
+            elif hasattr(train_dataset, 'labels'):
+                labels = train_dataset.labels
             
         if labels is not None and len(np.unique(labels)) > 1:
             logger.log(f"使用基于标签的 Dirichlet 分区 (alpha={config.dirichlet_alpha})")
             client_indices = partition_data_dirichlet(num_samples, config.num_clients, config.dirichlet_alpha, labels)
         else:
-            logger.log(f"未找到有效标签或标签单一，使用基于数据量的 Dirichlet 分区 (alpha={config.dirichlet_alpha})")
+            logger.log(f"警告: 未能提取到有效的场景或类别标签，回退到基于数据量的 Dirichlet 分区 (alpha={config.dirichlet_alpha})")
             client_indices = partition_data_dirichlet(num_samples, config.num_clients, config.dirichlet_alpha)
     elif config.partition_mode == "non-iid-shard":
         # 尝试从数据集获取标签以进行 Shard 分区
@@ -428,7 +440,7 @@ def run_federated_round(
             num_classes=logits.size(-1) if len(logits.shape) > 1 else 1
         )
         
-        # 计算自由能
+        # 计算自由能 (优化版：无论哪种模式都传入 prior_logits 以增强稳健性)
         if config.free_energy_mode == "kl_entropy":
             free_energy = client.compute_free_energy(
                 logits=logits,
@@ -437,7 +449,8 @@ def run_federated_round(
         else:  # ce_entropy
             free_energy = client.compute_free_energy(
                 logits=logits,
-                labels=labels
+                labels=labels,
+                server_prior_logits=prior_logits
             )
         #print(f"    Free Energies: {list(free_energies.values())}")
         
@@ -818,6 +831,7 @@ def parse_args():
     parser.add_argument('--tau', type=float, default=1.0, help='权重计算温度')
     parser.add_argument('--lambda_entropy', type=float, default=0.1, help='KL方案熵权重')
     parser.add_argument('--gamma_entropy', type=float, default=0.1, help='CE方案熵权重')
+    parser.add_argument('--beta_divergence', type=float, default=0.2, help='全局一致性惩罚权重')
     
     # 聚合策略参数
     parser.add_argument('--aggregation_method', type=str, default='active_inference',
@@ -870,6 +884,7 @@ def parse_args():
     parser.add_argument('--model_path', type=str,
                         default=r'Qwen/Qwen3-VL-2B-Instruct',
                         help='Qwen3-VL模型路径')
+    parser.add_argument('--lr', type=float, default=1e-4, help='本地训练学习率')
     
     # 设备和日志
     parser.add_argument('--device', type=str, default='cuda', help='计算设备')
@@ -901,6 +916,7 @@ def main():
             tau=args.tau,
             lambda_entropy=args.lambda_entropy,
             gamma_entropy=args.gamma_entropy,
+            beta_divergence=args.beta_divergence,
             aggregation_method=args.aggregation_method,
             fedprox_mu=args.fedprox_mu,
             alpha=args.alpha,
@@ -912,6 +928,7 @@ def main():
             generation_gamma=args.generation_gamma,
             enable_server_update=args.enable_server_update,
             server_lr=args.server_lr,
+            lr=args.lr,
             dataroot=args.dataroot,
             version=args.version,
             batch_size=args.batch_size,

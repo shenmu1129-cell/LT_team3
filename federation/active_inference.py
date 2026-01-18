@@ -120,20 +120,24 @@ def free_energy_ce_entropy(
     labels: torch.Tensor,
     temperature: float = 1.0,
     gamma_entropy: float = 0.1,
+    server_prior_logits: Optional[torch.Tensor] = None,
+    beta_divergence: float = 0.2,
     epsilon: float = 1e-8
 ) -> float:
     """
-    方案2: 基于交叉熵和熵的自由能
-    F_i = CE(y_true, q_i) + γ * H(q_i)
+    方案2: 基于交叉熵和熵的自由能 (增强版: 增加全局一致性约束)
+    F_i = CE(y_true, q_i) + γ * H(q_i) + β * KL(q_i || p_s)
     
-    该方案衡量客户端预测对真实标签的解释能力和不确定性。
-    F_i越小表示客户端能准确预测且确定性高，因此更可信。
+    该方案衡量客户端预测对真实标签的解释能力、预测的不确定性，
+    以及相对于全局先验的一致性。增加KL项可以防止恶意客户端通过过度的“虚假自信”降低自由能。
     
     Args:
         client_logits: 客户端预测logits [B, C]
         labels: 真实标签 [B]
         temperature: 温度参数T，用于软化分布
-        gamma_entropy: 熵权重γ，控制不确定性惩罚
+        gamma_entropy: 熵权重γ
+        server_prior_logits: 可选的服务器先验logits [B, C]
+        beta_divergence: 全局一致性权重β
         epsilon: 数值稳定性常数
         
     Returns:
@@ -158,11 +162,24 @@ def free_energy_ce_entropy(
             reduction='none'
         )  # [B]
     
-    # 计算熵
+    # 2. 计算预测分布的熵
     entropy = safe_entropy(q_i, epsilon)  # [B]
     
-    # 自由能 = 交叉熵 + γ * 熵
-    free_energy = ce_loss + gamma_entropy * entropy  # [B]
+    # [优化] 针对AD场景的逻辑修正：
+    # 恶意的投毒攻击往往表现为极低极低的不确定性（过分确信某个错误类别）
+    # 而干净的场景（复杂路况）往往带有自然的合理不确定性（熵稍高）。
+    # 如果熵过低（< 0.1），我们将其视为“可疑的过度拟合”，不再提供奖励，甚至给予微小惩罚。
+    entropy_penalty = torch.where(entropy < 0.1, 1.0 - entropy, entropy)
+    
+    # 3. 计算相对于先验的散度 (全局一致性惩罚)
+    if server_prior_logits is not None:
+        p_s = safe_softmax(server_prior_logits, temperature, epsilon)
+        kl_div = safe_kl_divergence(q_i, p_s, epsilon)
+    else:
+        kl_div = torch.zeros_like(entropy)
+    
+    # 自由能 = 交叉熵 + γ * 优化的熵项 + β * KL散度
+    free_energy = ce_loss + gamma_entropy * entropy_penalty + beta_divergence * kl_div  # [B]
     
     # 返回批次平均值
     return free_energy.mean().item()
@@ -177,24 +194,20 @@ def compute_client_weights(
     基于自由能计算归一化的客户端权重
     w_i = softmax(-F_i / τ)
     
-    自由能越小的客户端获得越大的权重。
-    温度参数τ控制权重分布的平滑度：
-    - τ较小：权重分布更集中在低自由能客户端
-    - τ较大：权重分布更均匀
-    
-    Args:
-        free_energies: 各客户端的自由能列表 [F_1, F_2, ..., F_N]
-        tau: 温度参数τ，控制权重分布的平滑度
-        epsilon: 数值稳定性常数
-        
-    Returns:
-        np.ndarray: 归一化权重数组 [w_1, w_2, ..., w_N]，和为1
+    优化点：增加数值平滑，防止在训练初期因自由能差异过大导致权重极化。
     """
     if not free_energies:
         return np.array([])
     
     # 转换为numpy数组
     F = np.array(free_energies, dtype=np.float64)
+    
+    # [优化] 如果是训练初期或自由能差异过大，进行对比度调整
+    # 限制自由能的动态范围，防止单个客户端权重过低
+    f_min = np.min(F)
+    f_max = np.max(F)
+    if f_max - f_min > 5.0:
+        F = np.clip(F, f_min, f_min + 5.0)
     
     # 处理异常值（NaN或Inf）
     if np.any(np.isnan(F)) or np.any(np.isinf(F)):
@@ -224,7 +237,8 @@ def compute_free_energy(
     mode: str = "kl_entropy",
     temperature: float = 1.0,
     lambda_entropy: float = 0.1,
-    gamma_entropy: float = 0.1
+    gamma_entropy: float = 0.1,
+    beta_divergence: float = 0.2
 ) -> float:
     """
     统一的自由能计算接口
@@ -237,6 +251,7 @@ def compute_free_energy(
         temperature: 温度参数
         lambda_entropy: KL方案的熵权重
         gamma_entropy: CE方案的熵权重
+        beta_divergence: 全局一致性权重 (CE方案专属)
         
     Returns:
         float: 自由能值
@@ -257,7 +272,9 @@ def compute_free_energy(
             client_logits,
             labels,
             temperature,
-            gamma_entropy
+            gamma_entropy,
+            server_prior_logits=server_prior_logits,
+            beta_divergence=beta_divergence
         )
     else:
         raise ValueError(f"未知的自由能计算模式: {mode}")

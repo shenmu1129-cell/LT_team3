@@ -38,6 +38,7 @@ class FederatedConfig:
     free_energy_mode: str = "kl_entropy"  # "kl_entropy" 或 "ce_entropy"
     lambda_entropy: float = 0.1  # KL方案的熵权重λ
     gamma_entropy: float = 0.1   # CE方案的熵权重γ
+    beta_divergence: float = 0.2 # CE方案的全局一致性权重β
     tau: float = 1.0  # 权重计算温度τ
     
     # ========== 聚合策略参数 ==========
@@ -56,7 +57,7 @@ class FederatedConfig:
     version: str = "v1.0-trainval"
     batch_size: int = 3
     partition_mode: str = "iid"  # "iid", "non-iid-dirichlet", "non-iid-shard"
-    dirichlet_alpha: float = 0.5 # 狄利克雷分布参数α，越小异构程度越高
+    dirichlet_alpha: float = 1.0 # 狄利克雷分布参数α，越小异构程度越高
     max_batches: int = 0  # 每轮每客户端最大训练batch数，0表示跑完整个epoch
     server_max_batches: int = 0  # 服务器公共数据集最大batch数，0表示跑完整个数据集
     num_workers: int = 2
@@ -72,7 +73,7 @@ class FederatedConfig:
     num_classes: int = 5              # 分类类别数 (1正常 + 4攻击)
     
     # ========== 训练参数 ==========
-    lr: float = 1e-4
+    lr: float = 1e-5
     weight_decay: float = 0.01
     
     # ========== 设备参数 ==========

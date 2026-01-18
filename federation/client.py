@@ -114,7 +114,8 @@ class FederatedClient:
             mode=self.config.free_energy_mode,
             temperature=self.config.temperature,
             lambda_entropy=self.config.lambda_entropy,
-            gamma_entropy=self.config.gamma_entropy
+            gamma_entropy=self.config.gamma_entropy,
+            beta_divergence=self.config.beta_divergence
         )
         
         self.free_energy_history.append(free_energy)
