@@ -123,6 +123,76 @@ def build_cases(args):
                     ]
                 cases.append((f"malratio_{ratio}_seed{seed}", cmd))
 
+    elif args.profile == "poison_strength":
+        strengths = [float(v) for v in args.strengths.split(",") if v.strip()]
+        for seed in seeds:
+            for strength in strengths:
+                tag = str(strength).replace(".", "p")
+                cmd = base_args(args, f"poison_strength_{tag}_seed{seed}", seed)
+                cmd += [
+                    "--client_attack_mode", "malicious",
+                    "--malicious_client_ratio", str(args.malicious_ratio),
+                    "--benign_attack_ratio", "0.0",
+                    "--malicious_attack_ratio", str(args.malicious_attack_ratio),
+                ]
+                if strength > 0:
+                    cmd += [
+                        "--enable_logit_poisoning",
+                        "--logit_poisoning_strength", str(strength),
+                    ]
+                cases.append((f"poison_strength_{strength}_seed{seed}", cmd))
+
+    elif args.profile == "attack_success":
+        ratios = [float(v) for v in args.ratios.split(",") if v.strip()]
+        strengths = [float(v) for v in args.strengths.split(",") if v.strip()]
+        alphas = [float(v) for v in args.dirichlet_alphas.split(",") if v.strip()]
+        for seed in seeds:
+            for alpha in alphas:
+                for ratio in ratios:
+                    for strength in strengths:
+                        ratio_tag = str(ratio).replace(".", "p")
+                        strength_tag = str(strength).replace(".", "p")
+                        alpha_tag = str(alpha).replace(".", "p")
+                        cmd = base_args(
+                            args,
+                            f"success_alpha{alpha_tag}_ratio{ratio_tag}_strength{strength_tag}_seed{seed}",
+                            seed,
+                        )
+                        if alpha >= 1.0:
+                            cmd[cmd.index("--partition_mode") + 1] = "iid"
+                            cmd[cmd.index("--dirichlet_alpha") + 1] = str(alpha)
+                        else:
+                            cmd[cmd.index("--partition_mode") + 1] = "non-iid-dirichlet"
+                            cmd[cmd.index("--dirichlet_alpha") + 1] = str(alpha)
+                        cmd += [
+                            "--client_attack_mode", "malicious",
+                            "--malicious_client_ratio", str(ratio),
+                            "--benign_attack_ratio", "0.0",
+                            "--malicious_attack_ratio", str(args.malicious_attack_ratio),
+                        ]
+                        if ratio > 0 and strength > 0:
+                            cmd += [
+                                "--enable_logit_poisoning",
+                                "--logit_poisoning_strength", str(strength),
+                            ]
+                        cases.append((f"attack_success_seed{seed}", cmd))
+
+    elif args.profile == "baseline_methods":
+        methods = [v.strip() for v in args.methods.split(",") if v.strip()]
+        for seed in seeds:
+            for method in methods:
+                cmd = base_args(args, f"baseline_{method}_seed{seed}", seed)
+                cmd[cmd.index("--aggregation_method") + 1] = method
+                cmd += [
+                    "--client_attack_mode", "malicious",
+                    "--malicious_client_ratio", str(args.malicious_ratio),
+                    "--benign_attack_ratio", "0.0",
+                    "--malicious_attack_ratio", str(args.malicious_attack_ratio),
+                    "--enable_logit_poisoning",
+                    "--logit_poisoning_strength", str(args.logit_poisoning_strength),
+                ]
+                cases.append((f"baseline_{method}_seed{seed}", cmd))
+
     else:
         raise ValueError(f"Unknown profile: {args.profile}")
 
@@ -132,14 +202,19 @@ def build_cases(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", choices=[
-        "smoke", "seed_variance", "non_iid_vs_malicious", "malicious_ratio"
+        "smoke", "seed_variance", "non_iid_vs_malicious", "malicious_ratio",
+        "poison_strength", "attack_success", "baseline_methods"
     ], default="smoke")
     parser.add_argument("--python", default="python")
     parser.add_argument("--output_root", default="experiments/reviewer_runs")
+    parser.add_argument("--run_root", default="")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--gpu", default="")
     parser.add_argument("--seeds", default="1,2,3,4,5")
     parser.add_argument("--ratios", default="0,0.1,0.2,0.3,0.4,0.5")
+    parser.add_argument("--strengths", default="0,2,5,8,12")
+    parser.add_argument("--dirichlet_alphas", default="1.0,0.1,0.05")
+    parser.add_argument("--methods", default="active_inference,fedavg,fedprox")
     parser.add_argument("--num_clients", type=int, default=20)
     parser.add_argument("--num_rounds", type=int, default=10)
     parser.add_argument("--local_epochs", type=int, default=1)
@@ -158,7 +233,9 @@ def main():
     parser.add_argument("--malicious_attack_ratio", type=float, default=0.8)
     parser.add_argument("--logit_poisoning_strength", type=float, default=5.0)
     args = parser.parse_args()
-    args.run_root = Path(args.output_root) / datetime.now().strftime("%Y%m%d_%H%M%S")
+    args.run_root = Path(args.run_root) if args.run_root else (
+        Path(args.output_root) / datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
 
     cases = build_cases(args)
     print(json.dumps({
