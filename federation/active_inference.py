@@ -11,7 +11,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 
 def safe_softmax(logits: torch.Tensor, temperature: float = 1.0, epsilon: float = 1e-8) -> torch.Tensor:
@@ -278,6 +278,63 @@ def compute_free_energy(
         )
     else:
         raise ValueError(f"未知的自由能计算模式: {mode}")
+
+
+def compute_free_energy_components(
+    client_logits: torch.Tensor,
+    labels: Optional[torch.Tensor] = None,
+    server_prior_logits: Optional[torch.Tensor] = None,
+    mode: str = "kl_entropy",
+    temperature: float = 1.0,
+    lambda_entropy: float = 0.1,
+    gamma_entropy: float = 0.1,
+    beta_divergence: float = 0.2,
+    epsilon: float = 1e-8
+) -> Dict[str, float]:
+    """
+    返回自由能分解项，供恶意客户端区分、ROC和失败模式分析使用。
+    """
+    q_i = safe_softmax(client_logits, temperature, epsilon)
+    entropy = safe_entropy(q_i, epsilon)
+
+    if server_prior_logits is not None:
+        p_s = safe_softmax(server_prior_logits, temperature, epsilon)
+        kl_div = safe_kl_divergence(q_i, p_s, epsilon)
+    else:
+        kl_div = torch.zeros_like(entropy)
+
+    if labels is not None:
+        if client_logits.shape[-1] == 1:
+            ce_loss = F.binary_cross_entropy_with_logits(
+                client_logits / temperature,
+                labels.float().view(-1, 1),
+                reduction='none'
+            ).squeeze(-1)
+        else:
+            ce_loss = F.cross_entropy(
+                client_logits / temperature,
+                labels,
+                reduction='none'
+            )
+    else:
+        ce_loss = torch.zeros_like(entropy)
+
+    entropy_penalty = torch.where(entropy < 0.1, 1.0 - entropy, entropy)
+    if mode == "kl_entropy":
+        free_energy = kl_div + lambda_entropy * entropy
+    elif mode == "ce_entropy":
+        free_energy = ce_loss + gamma_entropy * entropy_penalty + beta_divergence * kl_div
+    else:
+        raise ValueError(f"未知的自由能计算模式: {mode}")
+
+    return {
+        'free_energy': float(free_energy.mean().item()),
+        'kl_divergence': float(kl_div.mean().item()),
+        'entropy': float(entropy.mean().item()),
+        'entropy_penalty': float(entropy_penalty.mean().item()),
+        'cross_entropy': float(ce_loss.mean().item()),
+        'mode': mode,
+    }
 
 
 # ========== 测试和验证函数 ==========

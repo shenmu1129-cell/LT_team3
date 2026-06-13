@@ -17,10 +17,17 @@ import sys
 import argparse
 import time
 import json
+import random
 import torch
 import numpy as np
 from datetime import datetime
 from torch.utils.data import DataLoader, Subset, Dataset
+
+try:
+    import runtime_patches
+    runtime_patches.apply()
+except ImportError:
+    pass
 
 # 导入联邦学习模块
 from federation.client import FederatedClient
@@ -34,6 +41,7 @@ from federation.utils import (
     partition_data_dirichlet,
     aggregate_metrics
 )
+from federation.active_inference import compute_free_energy_components
 
 # 导入模型和数据集
 from test_local_train_mini_qwen3vl_fixed import (
@@ -73,18 +81,23 @@ class ClientLocalAttackDataset(Dataset):
     客户端本地攻击数据集包装器
     为每个客户端分配独立的数据索引，并在本地生成随机攻击。
     """
-    def __init__(self, base_dataset, indices, attack_ratio, config):
+    def __init__(self, base_dataset, indices, attack_ratio, config, client_id=0):
         self.base_dataset = base_dataset
         self.indices = indices
         self.attack_ratio = attack_ratio
         self.config = config
+        self.client_id = client_id
         
         # 记录样本总数
         self.num_samples = len(indices)
         
         # 预计算本地攻击分配 (保证每个epoch的一致性)
         # 使用第一个索引作为种子，使每个客户端的随机性不同但可复现
-        seed = indices[0] if (indices is not None and len(indices) > 0) else 42
+        base_seed = getattr(config, 'seed', 42)
+        seed = base_seed + client_id * 100003
+        if indices is not None and len(indices) > 0:
+            seed += int(indices[0])
+        self.seed = seed
         rng = np.random.RandomState(seed)
         
         self.local_is_attack = rng.rand(self.num_samples) < self.attack_ratio
@@ -130,7 +143,8 @@ class ClientLocalAttackDataset(Dataset):
                 num_points = self.config.num_points
                 if attacked_points.shape[0] > num_points:
                     # 如果点多了，进行随机采样
-                    sampled_indices = np.random.choice(attacked_points.shape[0], num_points, replace=False)
+                    sample_rng = np.random.RandomState(self.seed + idx)
+                    sampled_indices = sample_rng.choice(attacked_points.shape[0], num_points, replace=False)
                     attacked_points = attacked_points[sampled_indices]
                 elif attacked_points.shape[0] < num_points:
                     # 如果点少了，补齐到指定点数
@@ -160,6 +174,45 @@ class ClientLocalAttackDataset(Dataset):
         for t in self.local_attack_types:
             stats[t] = stats.get(t, 0) + 1
         return stats
+
+
+def set_global_seed(seed: int) -> None:
+    """设置随机种子，保证客户端选择和攻击分配可复现。"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def poison_logits(logits: torch.Tensor, target_class: int, strength: float) -> torch.Tensor:
+    """模拟恶意客户端上传的目标类 logit poisoning。"""
+    if strength <= 0:
+        return logits
+    poisoned = logits.clone()
+    if poisoned.shape[-1] == 1:
+        return poisoned + strength
+    target = int(target_class) % poisoned.shape[-1]
+    poisoned = poisoned - strength / max(poisoned.shape[-1] - 1, 1)
+    poisoned[..., target] = poisoned[..., target] + strength
+    return poisoned
+
+
+def ensure_non_empty_partitions(client_indices, num_samples, num_clients, logger):
+    """避免极小数据集或极端Dirichlet划分导致某个客户端没有样本。"""
+    empty_clients = [i for i, idxs in enumerate(client_indices) if len(idxs) == 0]
+    if not empty_clients:
+        return client_indices
+
+    logger.log(f"检测到空客户端 {empty_clients}，从样本最多的客户端重分配少量样本", "WARNING")
+    for empty_id in empty_clients:
+        donor_id = max(range(num_clients), key=lambda cid: len(client_indices[cid]))
+        if len(client_indices[donor_id]) <= 1:
+            fallback = partition_data_iid(num_samples, num_clients)
+            logger.log("可搬移样本不足，回退到IID分区以保证训练可运行", "WARNING")
+            return fallback
+        client_indices[empty_id].append(client_indices[donor_id].pop())
+    return client_indices
 
 
 def create_model(config: FederatedConfig):
@@ -282,22 +335,50 @@ def setup_clients(
     else:
         logger.log(f"未知分区模式 {config.partition_mode}，回退到 IID 分区")
         client_indices = partition_data_iid(num_samples, config.num_clients)
+    client_indices = ensure_non_empty_partitions(
+        client_indices, num_samples, config.num_clients, logger
+    )
     
-    # 确定哪些客户端是干净的
-    # 随机选择 num_clean_clients 个客户端
-    clean_client_ids = np.random.choice(config.num_clients, config.num_clean_clients, replace=False)
+    rng = np.random.RandomState(config.seed)
+    all_client_ids = np.arange(config.num_clients)
+    num_malicious_clients = int(round(config.num_clients * config.malicious_client_ratio))
+    num_malicious_clients = max(0, min(config.num_clients, num_malicious_clients))
+    malicious_client_ids = set(
+        rng.choice(all_client_ids, num_malicious_clients, replace=False).tolist()
+    )
+    remaining_client_ids = [cid for cid in all_client_ids if cid not in malicious_client_ids]
+    num_clean_clients = min(config.num_clean_clients, len(remaining_client_ids))
+    clean_client_ids = set(
+        rng.choice(remaining_client_ids, num_clean_clients, replace=False).tolist()
+        if num_clean_clients > 0 else []
+    )
+    logger.log(f"恶意客户端: {sorted(malicious_client_ids)} "
+               f"(ratio={config.malicious_client_ratio:.1%}, mode={config.client_attack_mode})")
     
     clients = []
     for i in range(config.num_clients):
         logger.log(f"\n初始化客户端 {i}...")
         
-        # 确定该客户端的攻击比例
-        if i in clean_client_ids:
+        is_malicious = i in malicious_client_ids
+        if config.client_attack_mode == "malicious":
+            local_attack_ratio = (
+                config.malicious_attack_ratio if is_malicious
+                else config.benign_attack_ratio
+            )
+            role = "malicious" if is_malicious else "benign"
+            logger.log(f"  - 客户端 {i} 角色={role}, attack_ratio={local_attack_ratio:.1%}")
+        elif i in clean_client_ids:
             local_attack_ratio = 0.0
             logger.log(f"  - 客户端 {i} 被设定为干净客户端 (attack_ratio = 0.0)")
+            role = "clean"
+        elif config.client_attack_mode == "fixed":
+            local_attack_ratio = config.attack_ratio
+            role = "fixed_attack"
+            logger.log(f"  - 客户端 {i} 固定攻击比例: {local_attack_ratio:.1%}")
         else:
             # 随机生成攻击比例 (0.1 到 0.6 之间随机)
-            local_attack_ratio = np.random.uniform(0.1, 0.6)
+            local_attack_ratio = rng.uniform(0.1, 0.6)
+            role = "random_attack"
             logger.log(f"  - 客户端 {i} 随机生成的攻击比例: {local_attack_ratio:.1%}")
             
         # 创建客户端专属数据集
@@ -305,7 +386,8 @@ def setup_clients(
             base_dataset=train_dataset,
             indices=client_indices[i],
             attack_ratio=local_attack_ratio,
-            config=config
+            config=config,
+            client_id=i
         )
         
         # 记录本地统计信息
@@ -334,6 +416,11 @@ def setup_clients(
             device=device,
             config=config
         )
+        client.is_malicious = bool(is_malicious)
+        client.attack_ratio = float(local_attack_ratio)
+        client.client_role = role
+        client.local_attack_stats = local_stats
+        client.num_local_samples = len(client_indices[i])
         
         clients.append(client)
         logger.log(f"  - 客户端 {i} 初始化完成")
@@ -435,6 +522,8 @@ def run_federated_round(
         'client_metrics': [],
         'free_energies': [],
         'weights': [],
+        'client_diagnostics': [],
+        'timing': {},
     }
     
     # ========== 阶段1: 客户端本地推理 + 计算自由能 ==========
@@ -445,13 +534,26 @@ def run_federated_round(
     client_batches = {}  # 保存每个客户端的batch，用于后续蒸馏
     
     for client in clients:
+        client_start = time.perf_counter()
         # 获取一个batch进行推理
         batch = next(iter(client.data_loader))
         client_batches[client.client_id] = batch
         
         # 本地前向推理
         logits, labels, sample_ids = client.local_forward(batch)
-        client_logits_dict[client.client_id] = logits
+        forward_ms = (time.perf_counter() - client_start) * 1000
+
+        logits_for_upload = logits
+        poisoned = False
+        if getattr(client, 'is_malicious', False) and config.enable_logit_poisoning:
+            logits_for_upload = poison_logits(
+                logits=logits,
+                target_class=config.logit_poisoning_target,
+                strength=config.logit_poisoning_strength
+            )
+            poisoned = True
+
+        client_logits_dict[client.client_id] = logits_for_upload
         client_labels_dict[client.client_id] = labels
         
         # 获取服务器先验logits
@@ -460,47 +562,92 @@ def run_federated_round(
             num_classes=logits.size(-1) if len(logits.shape) > 1 else 1
         )
         
-        # 计算自由能 (优化版：无论哪种模式都传入 prior_logits 以增强稳健性)
-        if config.free_energy_mode == "kl_entropy":
-            free_energy = client.compute_free_energy(
-                logits=logits,
-                server_prior_logits=prior_logits
-            )
-        else:  # ce_entropy
-            free_energy = client.compute_free_energy(
-                logits=logits,
-                labels=labels,
-                server_prior_logits=prior_logits
-            )
-        #print(f"    Free Energies: {list(free_energies.values())}")
+        components = compute_free_energy_components(
+            client_logits=logits_for_upload,
+            labels=labels,
+            server_prior_logits=prior_logits,
+            mode=config.free_energy_mode,
+            temperature=config.temperature,
+            lambda_entropy=config.lambda_entropy,
+            gamma_entropy=config.gamma_entropy,
+            beta_divergence=config.beta_divergence
+        )
+        free_energy = components['free_energy']
         
         round_metrics['free_energies'].append(free_energy)
+        round_metrics['client_diagnostics'].append({
+            'client_id': client.client_id,
+            'role': getattr(client, 'client_role', 'unknown'),
+            'is_malicious': bool(getattr(client, 'is_malicious', False)),
+            'attack_ratio': float(getattr(client, 'attack_ratio', 0.0)),
+            'local_attack_stats': getattr(client, 'local_attack_stats', {}),
+            'num_local_samples': int(getattr(client, 'num_local_samples', 0)),
+            'batch_size': int(labels.numel()),
+            'batch_attack_types': batch.get('attack_types', []),
+            'batch_labels': labels.detach().cpu().tolist(),
+            'logit_poisoned': poisoned,
+            'free_energy_components': components,
+            'forward_ms': forward_ms,
+        })
         
-        logger.log(f"  客户端 {client.client_id}: logits shape={logits.shape}, F={free_energy:.4f}")
+        logger.log(
+            f"  客户端 {client.client_id}: role={getattr(client, 'client_role', 'unknown')}, "
+            f"logits shape={logits_for_upload.shape}, F={free_energy:.4f}, "
+            f"KL={components['kl_divergence']:.4f}, H={components['entropy']:.4f}, "
+            f"poisoned={poisoned}"
+        )
     
     # ========== 阶段2: 上传logits到服务器 ==========
     logger.log("\n[阶段2] 上传logits到服务器")
     
+    upload_start = time.perf_counter()
     for client_id, logits in client_logits_dict.items():
         # 序列化（统计通信量）
         serialized = comm_manager.serialize_logits(logits)
         logger.log(f"  客户端 {client_id} 上传: {len(serialized)/1024:.2f} KB")
+    round_metrics['timing']['upload_serialize_ms'] = (time.perf_counter() - upload_start) * 1000
     
     # ========== 阶段3: 服务器计算权重 ==========
     logger.log("\n[阶段3] 服务器计算客户端权重")
     
+    weight_start = time.perf_counter()
     weights = server.compute_client_weights(round_metrics['free_energies'])
+    round_metrics['timing']['weight_compute_ms'] = (time.perf_counter() - weight_start) * 1000
     round_metrics['weights'] = weights.tolist()
     #print(f"    Weights: {list(weights.values())}")
     
     for i, (fe, w) in enumerate(zip(round_metrics['free_energies'], weights)):
         logger.log(f"  客户端 {i}: F={fe:.4f}, weight={w:.4f}")
+
+    malicious_weights = [
+        float(weights[d['client_id']]) for d in round_metrics['client_diagnostics']
+        if d['is_malicious']
+    ]
+    benign_weights = [
+        float(weights[d['client_id']]) for d in round_metrics['client_diagnostics']
+        if not d['is_malicious']
+    ]
+    if malicious_weights and benign_weights:
+        malicious_mean = float(np.mean(malicious_weights))
+        benign_mean = float(np.mean(benign_weights))
+        suppression = benign_mean / (malicious_mean + 1e-8)
+    else:
+        malicious_mean = 0.0
+        benign_mean = float(np.mean(benign_weights)) if benign_weights else 0.0
+        suppression = 0.0
+    round_metrics['weight_suppression'] = {
+        'benign_mean_weight': benign_mean,
+        'malicious_mean_weight': malicious_mean,
+        'benign_to_malicious_ratio': suppression,
+    }
     
     # ========== 阶段4: 服务器聚合logits ==========
     logger.log("\n[阶段4] 服务器聚合logits")
     
+    aggregate_start = time.perf_counter()
     client_logits_list, client_ids = server.collect_client_logits(client_logits_dict)
     global_logits = server.aggregate_logits(client_logits_list, weights)
+    round_metrics['timing']['aggregate_ms'] = (time.perf_counter() - aggregate_start) * 1000
     
     stats = server.get_aggregation_stats()
     logger.log_server_aggregation(weights, round_metrics['free_energies'], stats.get('latest', {}))
@@ -704,6 +851,8 @@ def run_federated_training(config: FederatedConfig):
     Args:
         config: 联邦学习配置
     """
+    set_global_seed(config.seed)
+
     # 设置设备
     device = config.device if torch.cuda.is_available() else 'cpu'
     print(f"使用设备: {device}")
@@ -717,6 +866,7 @@ def run_federated_training(config: FederatedConfig):
     logger.log("="*60)
     logger.log("联邦学习 + 主动推理 训练系统")
     logger.log("="*60)
+    logger.log(f"随机种子: {config.seed}")
     logger.log(f"\n配置:\n{config}")
     
     # 初始化通信管理器
@@ -800,15 +950,18 @@ def run_federated_training(config: FederatedConfig):
         avg_f1 = round_metrics['avg_metrics'].get('avg_f1_score', 0)
         if avg_f1 > best_avg_f1:
             best_avg_f1 = avg_f1
-            # 保存最佳服务器模型
-            server.save_model(os.path.join(config.save_dir, 'best_server_model.pth'))
-            # 保存最佳客户端模型
-            for client in clients:
-                torch.save(
-                    client.get_model_state(),
-                    os.path.join(config.save_dir, f'best_client_{client.client_id}_model.pth')
-                )
-            logger.log(f"  ✓ 保存最佳模型 (Avg F1: {best_avg_f1:.4f})")
+            if config.save_model_checkpoints:
+                # 保存最佳服务器模型
+                server.save_model(os.path.join(config.save_dir, 'best_server_model.pth'))
+                # 保存最佳客户端模型
+                for client in clients:
+                    torch.save(
+                        client.get_model_state(),
+                        os.path.join(config.save_dir, f'best_client_{client.client_id}_model.pth')
+                    )
+                logger.log(f"  ✓ 保存最佳模型 (Avg F1: {best_avg_f1:.4f})")
+            else:
+                logger.log(f"  跳过模型权重保存 (Avg F1: {best_avg_f1:.4f})")
         
         # 定期保存检查点
         # if (round_id + 1) % 5 == 0:
@@ -844,6 +997,7 @@ def parse_args():
     parser.add_argument('--num_clients', type=int, default=3, help='客户端数量')
     parser.add_argument('--num_rounds', type=int, default=10, help='联邦训练轮数')
     parser.add_argument('--local_epochs', type=int, default=1, help='本地训练轮数')
+    parser.add_argument('--seed', type=int, default=42, help='随机种子')
     
     # 主动推理参数
     parser.add_argument('--free_energy_mode', type=str, default='ce_entropy',
@@ -885,6 +1039,23 @@ def parse_args():
     parser.add_argument('--version', type=str, default='v1.0-trainval', help='数据集版本 (v1.0-trainval, v1.0-mini)')
     parser.add_argument('--batch_size', type=int, default=1, help='批次大小')
     parser.add_argument('--num_clean_clients', type=int, default=0, help='干净客户端的数量(attack_ratio为0)')
+    parser.add_argument('--attack_ratio', type=float, default=0.3,
+                        help='固定攻击比例或随机模式参考攻击比例')
+    parser.add_argument('--client_attack_mode', type=str, default='random',
+                        choices=['random', 'fixed', 'malicious'],
+                        help='客户端攻击分配模式')
+    parser.add_argument('--malicious_client_ratio', type=float, default=0.0,
+                        help='恶意客户端比例')
+    parser.add_argument('--benign_attack_ratio', type=float, default=0.0,
+                        help='良性客户端本地输入攻击比例')
+    parser.add_argument('--malicious_attack_ratio', type=float, default=0.6,
+                        help='恶意客户端本地输入攻击比例')
+    parser.add_argument('--enable_logit_poisoning', action='store_true',
+                        help='启用恶意客户端上传logit poisoning')
+    parser.add_argument('--logit_poisoning_strength', type=float, default=5.0,
+                        help='logit poisoning强度')
+    parser.add_argument('--logit_poisoning_target', type=int, default=0,
+                        help='logit poisoning目标类别')
     parser.add_argument('--partition_mode', type=str, default='iid', choices=['iid', 'non-iid-dirichlet', 'non-iid-shard'],
                         help='数据分区模式: iid, non-iid-dirichlet, non-iid-shard')
     parser.add_argument('--dirichlet_alpha', type=float, default=0.5,
@@ -912,6 +1083,8 @@ def parse_args():
     parser.add_argument('--device', type=str, default='cuda', help='计算设备')
     parser.add_argument('--log_dir', type=str, default='./logs_federated', help='日志目录')
     parser.add_argument('--save_dir', type=str, default='./checkpoints_federated', help='保存目录')
+    parser.add_argument('--no_save_model', action='store_true',
+                        help='只保存日志和metrics，不保存大模型权重')
     parser.add_argument('--verbose', action='store_true', help='详细输出')
     
     return parser.parse_args()
@@ -934,6 +1107,7 @@ def main():
             num_clients=args.num_clients,
             num_rounds=args.num_rounds,
             local_epochs=args.local_epochs,
+            seed=args.seed,
             free_energy_mode=args.free_energy_mode,
             tau=args.tau,
             lambda_entropy=args.lambda_entropy,
@@ -955,6 +1129,14 @@ def main():
             version=args.version,
             batch_size=args.batch_size,
             num_clean_clients=args.num_clean_clients,
+            attack_ratio=args.attack_ratio,
+            client_attack_mode=args.client_attack_mode,
+            malicious_client_ratio=args.malicious_client_ratio,
+            benign_attack_ratio=args.benign_attack_ratio,
+            malicious_attack_ratio=args.malicious_attack_ratio,
+            enable_logit_poisoning=args.enable_logit_poisoning,
+            logit_poisoning_strength=args.logit_poisoning_strength,
+            logit_poisoning_target=args.logit_poisoning_target,
             partition_mode=args.partition_mode,
             dirichlet_alpha=args.dirichlet_alpha,
             use_attack_dataset=use_attack_dataset,
@@ -965,6 +1147,7 @@ def main():
             device=args.device,
             log_dir=args.log_dir,
             save_dir=args.save_dir,
+            save_model_checkpoints=not args.no_save_model,
             verbose=args.verbose
         )
     

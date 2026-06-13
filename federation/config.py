@@ -17,6 +17,7 @@ class FederatedConfig:
     num_clients: int = 3
     num_rounds: int = 10
     local_epochs: int = 1
+    seed: int = 42
     
     # ========== 模型参数 ==========
     model_path: str = "/home/sutongtong/wwt/model/Qwen3-VL-2B-Instruct"
@@ -65,6 +66,12 @@ class FederatedConfig:
     attack_ratio: float = 0.3  # 全局基础比例（如果启用随机则作为参考）
     num_clean_clients: int = 0 # 干净客户端数量 (attack_ratio 固定为 0)
     malicious_client_ratio: float = 0.0  # 恶意客户端比例 (0.0-1.0)
+    client_attack_mode: str = "random"  # "random", "fixed", "malicious"
+    benign_attack_ratio: float = 0.0
+    malicious_attack_ratio: float = 0.6
+    enable_logit_poisoning: bool = False
+    logit_poisoning_strength: float = 5.0
+    logit_poisoning_target: int = 0
     num_points: int = 2048
     
     # ========== 攻击数据集参数 ==========
@@ -83,6 +90,7 @@ class FederatedConfig:
     # ========== 日志参数 ==========
     log_dir: str = "./logs_federated"
     save_dir: str = "./checkpoints_federated"
+    save_model_checkpoints: bool = True
     verbose: bool = True
     
     # ========== 部署模式 ==========
@@ -92,6 +100,12 @@ class FederatedConfig:
         """验证配置参数的合法性"""
         assert self.num_clients > 0, "num_clients必须大于0"
         assert 0 <= self.malicious_client_ratio <= 1.0, "malicious_client_ratio必须在[0, 1]范围内"
+        assert self.client_attack_mode in ["random", "fixed", "malicious"], \
+            "client_attack_mode必须是'random', 'fixed'或'malicious'"
+        assert 0 <= self.attack_ratio <= 1.0, "attack_ratio必须在[0, 1]范围内"
+        assert 0 <= self.benign_attack_ratio <= 1.0, "benign_attack_ratio必须在[0, 1]范围内"
+        assert 0 <= self.malicious_attack_ratio <= 1.0, "malicious_attack_ratio必须在[0, 1]范围内"
+        assert self.logit_poisoning_strength >= 0, "logit_poisoning_strength必须非负"
         assert self.num_rounds > 0, "num_rounds必须大于0"
         assert self.local_epochs > 0, "local_epochs必须大于0"
         

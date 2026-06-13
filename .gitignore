@@ -9,6 +9,7 @@ logs_qwen3vl/
 nohup.out
 test_outputs/
 backup/
+experiments/reviewer_runs/
 
 # checkpoints / weights
 checkpoints_federated/

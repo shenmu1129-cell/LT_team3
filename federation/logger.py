@@ -39,6 +39,7 @@ class RoundMetrics:
     communication_mb: float = 0.0
     free_energies: List[float] = field(default_factory=list)
     weights: List[float] = field(default_factory=list)
+    extra_metrics: Dict[str, Any] = field(default_factory=dict)
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
     
     def to_dict(self) -> Dict[str, Any]:
@@ -62,6 +63,7 @@ class RoundMetrics:
             'communication_mb': self.communication_mb,
             'free_energies': self.free_energies,
             'weights': self.weights,
+            'extra_metrics': self.extra_metrics,
             'timestamp': self.timestamp
         }
 
@@ -203,6 +205,20 @@ class FederatedLogger:
                 free_energies=round_metrics.get('free_energies', []),
                 weights=round_metrics.get('weights', [])
             )
+            known_keys = {
+                'round_id', 'client_metrics', 'server_metrics',
+                'communication', 'communication_mb', 'free_energies',
+                'weights', 'avg_metrics'
+            }
+            rm.extra_metrics = {
+                k: v for k, v in round_metrics.items()
+                if k not in known_keys
+            }
+            rm.server_metrics = round_metrics.get('server_metrics', {})
+            if 'communication' in round_metrics:
+                rm.communication_mb = round_metrics['communication'].get('round_mb', 0.0)
+            else:
+                rm.communication_mb = round_metrics.get('communication_mb', 0.0)
             
             # 处理client_metrics
             client_metrics_list = round_metrics.get('client_metrics', [])
