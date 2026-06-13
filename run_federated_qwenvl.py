@@ -38,6 +38,8 @@ from federation.utils import (
 # 导入模型和数据集
 from test_local_train_mini_qwen3vl_fixed import (
     Qwen3VLDefenseSystem,
+    OvisDefenseSystem,
+    InternVLDefenseSystem,
     NuScenesMiniDataset,
     custom_collate_fn
 )
@@ -161,8 +163,26 @@ class ClientLocalAttackDataset(Dataset):
 
 
 def create_model(config: FederatedConfig):
-    """创建Qwen3VL防御系统模型"""
+    """创建防御系统模型"""
     
+    if config.model_type == "ovis":
+        print(f"创建 OvisDefenseSystem 模型: {config.model_path}")
+        model = OvisDefenseSystem(
+            pointcloud_dim=config.pointcloud_dim,
+            ovis_hidden_dim=None,  # 自动检测
+            model_name=config.model_path
+        )
+        return model
+    
+    if config.model_type == "internvl":
+        print(f"创建 InternVLDefenseSystem 模型: {config.model_path}")
+        model = InternVLDefenseSystem(
+            pointcloud_dim=config.pointcloud_dim,
+            internvl_hidden_dim=None,  # 自动检测
+            model_name=config.model_path
+        )
+        return model
+        
     if config.train_generation:
         # 使用增强模型（支持训练LLM生成任务）
         try:
@@ -791,10 +811,10 @@ def run_federated_training(config: FederatedConfig):
             logger.log(f"  ✓ 保存最佳模型 (Avg F1: {best_avg_f1:.4f})")
         
         # 定期保存检查点
-        if (round_id + 1) % 5 == 0:
-            checkpoint_path = os.path.join(config.save_dir, f'checkpoint_round_{round_id+1}.pth')
-            server.save_model(checkpoint_path)
-            logger.log(f"  ✓ 保存检查点: {checkpoint_path}")
+        # if (round_id + 1) % 5 == 0:
+        #     checkpoint_path = os.path.join(config.save_dir, f'checkpoint_round_{round_id+1}.pth')
+        #     server.save_model(checkpoint_path)
+        #     logger.log(f"  ✓ 保存检查点: {checkpoint_path}")
     
     # ========== 训练完成 ==========
     logger.log("\n" + "="*60)
@@ -881,9 +901,11 @@ def parse_args():
                         help='合成数据样本数量')
     
     # 模型参数
+    parser.add_argument('--model_type', type=str, default='qwen3vl', choices=['qwen3vl', 'ovis', 'internvl'],
+                        help='模型类型: qwen3vl, ovis 或 internvl')
     parser.add_argument('--model_path', type=str,
                         default=r'Qwen/Qwen3-VL-2B-Instruct',
-                        help='Qwen3-VL模型路径')
+                        help='模型路径')
     parser.add_argument('--lr', type=float, default=1e-4, help='本地训练学习率')
     
     # 设备和日志
@@ -938,6 +960,7 @@ def main():
             use_attack_dataset=use_attack_dataset,
             use_synthetic_data=args.use_synthetic_data,
             num_synthetic_samples=args.num_synthetic_samples,
+            model_type=args.model_type,
             model_path=args.model_path,
             device=args.device,
             log_dir=args.log_dir,

@@ -20,6 +20,7 @@ class FederatedConfig:
     
     # ========== 模型参数 ==========
     model_path: str = "/home/sutongtong/wwt/model/Qwen3-VL-2B-Instruct"
+    model_type: str = "qwen3vl"  # "qwen3vl", "ovis", 或 "internvl"
     pointcloud_dim: int = 1024
     qwen_hidden_dim: Optional[int] = None  # None表示自动检测
     

@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 
 # logs & outputs
+logs/
 logs_federated/
 logs_qwen3vl/
 test_outputs/

@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoModelForImageTextToText, AutoProcessor, AutoModelForCausalLM, AutoTokenizer, AutoModel
 from qwen_vl_utils import process_vision_info
 from torchvision import transforms
 import numpy as np
@@ -481,6 +481,467 @@ class Qwen3VLDefenseSystem(nn.Module):
         
         return result
 
+
+class OvisDefenseSystem(nn.Module):
+    """基于Ovis 2.5的自动驾驶攻击检测与防御系统"""
+    
+    def __init__(self, 
+                 pointcloud_dim=1024,
+                 ovis_hidden_dim=None,  # 自动检测，或手动指定
+                 model_name=r'/home/sutongtong/wwt/model/Ovis2.5-2B',
+                 num_classes=5):
+        super().__init__()
+        
+        self.pointcloud_dim = pointcloud_dim
+        self.num_classes = num_classes
+        
+        # 1. 加载Ovis模型
+        print(f"正在加载Ovis 2.5模型: {model_name}")
+        self.ovis_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            multimodal_max_length=8192,
+            trust_remote_code=True,
+            device_map="auto"
+        )
+        self.text_tokenizer = self.ovis_model.text_tokenizer
+        self.visual_tokenizer = self.ovis_model.visual_tokenizer
+        
+        # 确保 tokenizer 有 pad_token
+        if self.text_tokenizer.pad_token_id is None:
+            self.text_tokenizer.pad_token = self.text_tokenizer.eos_token
+            print(f"[信息] Tokenizer 缺少 pad_token，已设置为 eos_token")
+        
+        # 2. 自动检测隐藏层维度
+        if ovis_hidden_dim is None:
+            ovis_hidden_dim = self.ovis_model.config.hidden_size
+        self.ovis_hidden_dim = ovis_hidden_dim
+        print(f"[模型信息] Ovis隐藏层维度: {ovis_hidden_dim}, 点云特征维度: {pointcloud_dim}")
+        
+        # 3. 点云编码器
+        self.pointcloud_encoder = PointCloudEncoder(output_dim=pointcloud_dim)
+        
+        # 4. 点云特征适配器
+        self.pointcloud_adapter = PointCloudAdapter(
+            pointcloud_dim=pointcloud_dim,
+            qwen_hidden_dim=ovis_hidden_dim
+        )
+        
+        # 5. 可训练的分类头
+        self.classifier = nn.Sequential(
+            nn.Linear(ovis_hidden_dim + pointcloud_dim, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_classes)
+        )
+        
+        # 冻结核心参数
+        for param in self.ovis_model.parameters():
+            param.requires_grad = False
+            
+    def forward(self, images, pointclouds, mode='train', attack_type=None):
+        batch_size = pointclouds.size(0) if torch.is_tensor(pointclouds) else len(pointclouds)
+        
+        # 1. 处理点云特征
+        pc_features = self.pointcloud_encoder(pointclouds)
+        pc_embeddings = self.pointcloud_adapter(pc_features)
+        
+        # 2. 根据模式选择
+        if mode == 'train':
+            return self._training_forward(images, pc_features, batch_size)
+        elif mode == 'detect':
+            return self._detection_mode(images, pc_embeddings, batch_size)
+        elif mode == 'defend':
+            return self._defense_mode(images, pc_embeddings, attack_type, batch_size)
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+    def _training_forward(self, images, pc_features, batch_size):
+        logits_list = []
+        for i in range(batch_size):
+            if isinstance(images, list):
+                image = images[i]
+            else:
+                image = transforms.ToPILImage()(images[i].cpu())
+            
+            vision_feature = self._extract_vision_features(image)
+            pc_feature = pc_features[i]
+            
+            if pc_feature.device != vision_feature.device:
+                pc_feature = pc_feature.to(vision_feature.device)
+            
+            vision_feature = vision_feature.float()
+            pc_feature = pc_feature.float()
+            
+            combined_feature = torch.cat([vision_feature, pc_feature], dim=0)
+            
+            # 维度检查与动态调整
+            if i == 0 and not hasattr(self, '_dim_checked'):
+                actual_dim = combined_feature.shape[0]
+                if actual_dim != (self.ovis_hidden_dim + self.pointcloud_dim):
+                    self.classifier = nn.Sequential(
+                        nn.Linear(actual_dim, 512),
+                        nn.LayerNorm(512),
+                        nn.ReLU(),
+                        nn.Dropout(0.3),
+                        nn.Linear(512, 256),
+                        nn.LayerNorm(256),
+                        nn.ReLU(),
+                        nn.Dropout(0.2),
+                        nn.Linear(256, self.num_classes)
+                    ).to(combined_feature.device)
+                self._dim_checked = True
+                
+            logit = self.classifier(combined_feature)
+            logits_list.append(logit)
+            
+        return torch.stack(logits_list, dim=0)
+
+    def _extract_vision_features(self, image):
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": "Analyze this image."},
+            ],
+        }]
+        
+        # Ovis 特有的输入处理
+        input_ids, pixel_values, grid_thws = self.ovis_model.preprocess_inputs(messages)
+        
+        # 前向传播（保留梯度）
+        with torch.set_grad_enabled(self.training):
+            # 将输入移动到设备上，并处理 None 的情况
+            device = next(self.ovis_model.parameters()).device
+            input_ids = input_ids.to(device)
+            pixel_values = pixel_values.to(device) if pixel_values is not None else None
+            grid_thws = grid_thws.to(device) if grid_thws is not None else None
+            
+            # 生成 attention_mask
+            attention_mask = torch.ne(input_ids, self.text_tokenizer.pad_token_id).to(device)
+            
+            outputs = self.ovis_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                grid_thws=grid_thws,
+                output_hidden_states=True
+            )
+            # 取最后一层隐藏状态，并进行池化
+            hidden_states = outputs.hidden_states[-1]  # [1, seq_len, hidden_dim]
+            vision_feature = hidden_states.mean(dim=1).squeeze(0)  # [hidden_dim]
+            
+        return vision_feature
+
+    def _detection_mode(self, images, pc_embeddings, batch_size):
+        results = []
+        for i in range(batch_size):
+            image = images[i] if isinstance(images, list) else transforms.ToPILImage()(images[i].cpu())
+            pc_embed = pc_embeddings[i] if pc_embeddings is not None else None
+            
+            query_text = self._build_detection_query(pc_embed)
+            messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": query_text}]}]
+            
+            response = self._generate_response(messages)
+            results.append(self._parse_detection_result(response))
+        return results
+
+    def _defense_mode(self, images, pc_embeddings, attack_type, batch_size):
+        results = []
+        for i in range(batch_size):
+            image = images[i] if isinstance(images, list) else transforms.ToPILImage()(images[i].cpu())
+            # pc_embed = pc_embeddings[i] if pc_embeddings is not None else None
+            query_text = self._build_defense_query(attack_type)
+            messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": query_text}]}]
+            
+            response = self._generate_response(messages)
+            results.append(response)
+        return results
+
+    def _generate_response(self, messages):
+        input_ids, pixel_values, grid_thws = self.ovis_model.preprocess_inputs(messages)
+        
+        with torch.no_grad():
+            device = next(self.ovis_model.parameters()).device
+            output_ids = self.ovis_model.generate(
+                input_ids.to(device),
+                pixel_values=pixel_values.to(device) if pixel_values is not None else None,
+                grid_thws=grid_thws.to(device) if grid_thws is not None else None,
+                max_new_tokens=512,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9
+            )
+            
+        # 裁剪掉输入部分
+        output_ids = output_ids[0, input_ids.shape[1]:]
+        response = self.text_tokenizer.decode(output_ids, skip_special_tokens=True)
+        return response
+
+    def _build_detection_query(self, pc_embed=None):
+        query_text = """请仔细分析这张自动驾驶场景图像,检测是否存在对抗攻击或异常。
+
+可能的攻击类型包括:
+1. **对抗样本攻击** (Adversarial Patch)
+2. **传感器欺骗攻击** (Sensor Spoofing)
+3. **物理攻击** (Physical Attack)
+4. **数据完整性攻击**
+
+"""
+        if pc_embed is not None:
+            query_text += "\n请结合激光雷达点云特征的一致性进行判断。\n"
+            
+        query_text += """请按以下JSON格式严格回答:
+{
+    "is_attack": true/false,
+    "attack_type": "攻击类型名称" 或 null,
+    "confidence": 0.0-1.0,
+    "risk_level": "低/中/高/紧急",
+    "analysis": "分析依据"
+}
+请直接输出JSON:"""
+        return query_text
+
+    def _build_defense_query(self, attack_type):
+        return f"""检测到自动驾驶系统受到攻击! 类型: {attack_type if attack_type else "未知"}
+
+请基于这张场景图像,提供详细的应对方案，包括立即响应、数据净化、系统恢复和预防建议。"""
+
+    def _parse_detection_result(self, response_text):
+        try:
+            start_idx = response_text.find('{')
+            end_idx = response_text.rfind('}')
+            if start_idx != -1 and end_idx != -1:
+                return json.loads(response_text[start_idx:end_idx+1])
+        except:
+            pass
+        return {"is_attack": "unknown" in response_text.lower(), "analysis": response_text[:200]}
+
+class InternVLDefenseSystem(nn.Module):
+    """基于InternVL3-2B的自动驾驶攻击检测与防御系统"""
+    
+    def __init__(self, 
+                 pointcloud_dim=1024,
+                 internvl_hidden_dim=None,
+                 model_name=r'/home/sutongtong/wwt/model/InternVL3-2B',
+                 num_classes=5):
+        super().__init__()
+        
+        self.pointcloud_dim = pointcloud_dim
+        self.num_classes = num_classes
+        
+        # 1. 加载InternVL模型
+        print(f"正在加载InternVL 3-2B模型: {model_name}")
+        self.model = AutoModel.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            device_map="auto"
+        ).eval()
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=False)
+        
+        # 2. 自动检测隐藏层维度
+        if internvl_hidden_dim is None:
+            internvl_hidden_dim = self.model.config.hidden_size
+        self.internvl_hidden_dim = internvl_hidden_dim
+        print(f"[模型信息] InternVL隐藏层维度: {internvl_hidden_dim}, 点云特征维度: {pointcloud_dim}")
+        
+        # 3. 设置图像转换
+        self.image_size = self.model.config.force_image_size
+        self.patch_size = 14
+        self.image_transform = self._build_transform(self.image_size)
+        
+        # 4. 点云编码器
+        self.pointcloud_encoder = PointCloudEncoder(output_dim=pointcloud_dim)
+        
+        # 5. 点云特征适配器
+        self.pointcloud_adapter = PointCloudAdapter(
+            pointcloud_dim=pointcloud_dim,
+            qwen_hidden_dim=internvl_hidden_dim
+        )
+        
+        # 6. 可训练的分类头
+        self.classifier = nn.Sequential(
+            nn.Linear(internvl_hidden_dim + pointcloud_dim, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_classes)
+        )
+        
+        # 冻结核心参数
+        for param in self.model.parameters():
+            param.requires_grad = False
+            
+    def _build_transform(self, input_size):
+        MEAN, STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+        return transforms.Compose([
+            transforms.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+            transforms.Resize((input_size, input_size), interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=MEAN, std=STD)
+        ])
+
+    def forward(self, images, pointclouds, mode='train', attack_type=None):
+        batch_size = pointclouds.size(0) if torch.is_tensor(pointclouds) else len(pointclouds)
+        
+        # 1. 处理点云特征
+        pc_features = self.pointcloud_encoder(pointclouds)
+        pc_embeddings = self.pointcloud_adapter(pc_features)
+        
+        # 2. 根据模式选择
+        if mode == 'train':
+            return self._training_forward(images, pc_features, batch_size)
+        elif mode == 'detect':
+            return self._detection_mode(images, pc_embeddings, batch_size)
+        elif mode == 'defend':
+            return self._defense_mode(images, pc_embeddings, attack_type, batch_size)
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+    def _training_forward(self, images, pc_features, batch_size):
+        logits_list = []
+        for i in range(batch_size):
+            if isinstance(images, list):
+                image = images[i]
+            else:
+                image = transforms.ToPILImage()(images[i].cpu())
+            
+            vision_feature = self._extract_vision_features(image)
+            pc_feature = pc_features[i]
+            
+            if pc_feature.device != vision_feature.device:
+                pc_feature = pc_feature.to(vision_feature.device)
+            
+            vision_feature = vision_feature.float()
+            pc_feature = pc_feature.float()
+            
+            combined_feature = torch.cat([vision_feature, pc_feature], dim=0)
+            
+            # 维度检查与动态调整
+            if i == 0 and not hasattr(self, '_dim_checked'):
+                actual_dim = combined_feature.shape[0]
+                if actual_dim != (self.internvl_hidden_dim + self.pointcloud_dim):
+                    self.classifier = nn.Sequential(
+                        nn.Linear(actual_dim, 512),
+                        nn.LayerNorm(512),
+                        nn.ReLU(),
+                        nn.Dropout(0.3),
+                        nn.Linear(512, 256),
+                        nn.LayerNorm(256),
+                        nn.ReLU(),
+                        nn.Dropout(0.2),
+                        nn.Linear(256, self.num_classes)
+                    ).to(combined_feature.device)
+                self._dim_checked = True
+                
+            logit = self.classifier(combined_feature)
+            logits_list.append(logit)
+            
+        return torch.stack(logits_list, dim=0)
+
+    def _extract_vision_features(self, image):
+        # 处理图像
+        pixel_values = self.image_transform(image).unsqueeze(0).to(device=next(self.model.parameters()).device, dtype=torch.bfloat16)
+        
+        # 前向传播提取视觉特征（保留梯度）
+        with torch.set_grad_enabled(self.training):
+            # InternVL 有 extract_feature 方法
+            vit_embeds = self.model.extract_feature(pixel_values)
+            # 使用平均池化得到全局特征
+            vision_feature = vit_embeds.mean(dim=1).squeeze(0)  # [hidden_dim]
+            
+        return vision_feature
+
+    def _detection_mode(self, images, pc_embeddings, batch_size):
+        results = []
+        for i in range(batch_size):
+            image = images[i] if isinstance(images, list) else transforms.ToPILImage()(images[i].cpu())
+            pc_embed = pc_embeddings[i] if pc_embeddings is not None else None
+            
+            query_text = self._build_detection_query(pc_embed)
+            response = self._generate_response(image, query_text)
+            results.append(self._parse_detection_result(response))
+        return results
+
+    def _defense_mode(self, images, pc_embeddings, attack_type, batch_size):
+        results = []
+        for i in range(batch_size):
+            image = images[i] if isinstance(images, list) else transforms.ToPILImage()(images[i].cpu())
+            query_text = self._build_defense_query(attack_type)
+            response = self._generate_response(image, query_text)
+            results.append(response)
+        return results
+
+    def _generate_response(self, image, query):
+        pixel_values = self.image_transform(image).unsqueeze(0).to(device=next(self.model.parameters()).device, dtype=torch.bfloat16)
+        
+        with torch.no_grad():
+            if hasattr(self.model, 'chat'):
+                response = self.model.chat(self.tokenizer, pixel_values, query, generation_config={'max_new_tokens': 512, 'do_sample': True})
+            else:
+                # 手动构建生成的输入
+                prompt = f"<img><IMG_CONTEXT></img>\n{query}"
+                inputs = self.tokenizer(prompt, return_tensors='pt').to(device=next(self.model.parameters()).device)
+                output_ids = self.model.generate(
+                    pixel_values=pixel_values,
+                    input_ids=inputs.input_ids,
+                    attention_mask=inputs.attention_mask,
+                    max_new_tokens=512,
+                    do_sample=True,
+                    temperature=0.7
+                )
+                response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        return response
+
+    def _build_detection_query(self, pc_embed=None):
+        query_text = """请仔细分析这张自动驾驶场景图像,检测是否存在对抗攻击或异常。
+
+可能的攻击类型包括:
+1. **对抗样本攻击** (Adversarial Patch)
+2. **传感器欺骗攻击** (Sensor Spoofing)
+3. **物理攻击** (Physical Attack)
+4. **数据完整性攻击**
+
+"""
+        if pc_embed is not None:
+            query_text += "\n请结合激光雷达点云特征的一致性进行判断。\n"
+            
+        query_text += """请按以下JSON格式严格回答:
+{
+    "is_attack": true/false,
+    "attack_type": "攻击类型名称" 或 null,
+    "confidence": 0.0-1.0,
+    "risk_level": "低/中/高/紧急",
+    "analysis": "分析依据"
+}
+请直接输出JSON:"""
+        return query_text
+
+    def _build_defense_query(self, attack_type):
+        return f"""检测到自动驾驶系统受到攻击! 类型: {attack_type if attack_type else "未知"}
+
+请基于这张场景图像,提供详细的应对方案，包括立即响应、数据净化、系统恢复和预防建议。"""
+
+    def _parse_detection_result(self, response_text):
+        try:
+            start_idx = response_text.find('{')
+            end_idx = response_text.rfind('}')
+            if start_idx != -1 and end_idx != -1:
+                return json.loads(response_text[start_idx:end_idx+1])
+        except:
+            pass
+        return {"is_attack": "unknown" in response_text.lower(), "analysis": response_text[:200]}
 
 class PointCloudEncoder(nn.Module):
     """点云编码器"""
