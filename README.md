@@ -2,7 +2,7 @@
 
 ## Reviewer Experiment Results Entry
 
-This repository includes a curated Markdown summary of the previously completed reviewer-response experiments for the AIFLID project.
+This repository includes a curated Markdown summary and committed CSV result tables for the previously completed reviewer-response experiments for the AIFLID project.
 
 ### GitHub Experiment Address
 
@@ -10,9 +10,23 @@ Main readable report:
 
 [experiments/reviewer_results/previous_results_20260617/summary_report.md](experiments/reviewer_results/previous_results_20260617/summary_report.md)
 
-Direct GitHub URL:
+Committed CSV directory:
 
-https://github.com/shenmu1129-cell/LT_team3/blob/codex/reviewer-results-20260617/experiments/reviewer_results/previous_results_20260617/summary_report.md
+[experiments/reviewer_results/previous_results_20260617/csv/](experiments/reviewer_results/previous_results_20260617/csv/)
+
+Direct GitHub URLs:
+
+- Report: https://github.com/shenmu1129-cell/LT_team3/blob/codex/reviewer-results-20260617/experiments/reviewer_results/previous_results_20260617/summary_report.md
+- CSV directory: https://github.com/shenmu1129-cell/LT_team3/tree/codex/reviewer-results-20260617/experiments/reviewer_results/previous_results_20260617/csv
+
+### Committed CSV Files
+
+These CSV files are committed in GitHub for GPT-side reading:
+
+- `malicious_ratio_case_group_mean_std.csv`: malicious ratio robustness-boundary summary.
+- `poison_strength_case_group_mean_std.csv`: logit poisoning strength summary.
+- `vfe_auroc_results.csv`: VFE malicious-client AUROC and suppression summary.
+- `vfe_benign_malicious_distribution_by_group.csv`: benign/malicious VFE distribution statistics by experiment group.
 
 ### What The Report Contains
 
