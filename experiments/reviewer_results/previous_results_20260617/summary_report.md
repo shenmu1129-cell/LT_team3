@@ -1,6 +1,18 @@
 # Reviewer Experiment Results (Curated)
 
-This folder records the already completed reviewer-response experiments for the AIFLID rebuttal/resubmission package. The full curated archive remains on the experiment server at:
+This folder records the already completed reviewer-response experiments for the AIFLID rebuttal/resubmission package.
+
+## GitHub Experiment Address
+
+Repository path:
+
+`experiments/reviewer_results/previous_results_20260617/summary_report.md`
+
+Direct GitHub URL:
+
+https://github.com/shenmu1129-cell/LT_team3/blob/codex/reviewer-results-20260617/experiments/reviewer_results/previous_results_20260617/summary_report.md
+
+The full curated archive remains on the experiment server at:
 
 `/home/sutongtong/wwt/code/fedmkt-based_bak/experiments/reviewer_runs/curated_previous_results_20260617_124151`
 
